@@ -135,31 +135,116 @@ def test_empty_search_and_failed_fetches_do_not_call_ai(api):
     search.standardizer.standardize_and_rank.assert_not_called()
 
 
-@pytest.mark.parametrize("offers", [
-    [offer_data(source_id="invented")],
-    [offer_data(), offer_data()],
-    [offer_data(price_quote="$0.01 CAD")],
-    [offer_data(product_quote="Organic certified")],
-    [offer_data(variant_quote="Sweetened")],
-    [offer_data(extra="unexpected")],
+@pytest.mark.parametrize("offers,reason,field", [
+    ([offer_data(source_id="invented")], "unknown_or_duplicate_source", "source_id"),
+    ([offer_data(price_quote="$0.01 CAD")], "quote_not_in_source", "price_quote"),
+    ([offer_data(product_quote="Organic certified")], "quote_not_in_source", "product_quote"),
+    ([offer_data(variant_quote="Sweetened")], "variant_not_evidenced", "variant_quote"),
+    ([offer_data(extra="unexpected")], "invalid_offer_fields", "-"),
+    ([offer_data(product_type="almond_milk")], "category_not_evidenced", "product_quote"),
+    ([offer_data(variant="unknown")], "unknown_variant_has_quote", "variant_quote"),
+    ([offer_data(availability_quote="Example Unsweetened Oat Milk 1L")],
+     "availability_not_recognized", "availability_quote"),
 ])
-def test_rejects_ungrounded_ai_output(monkeypatch, offers):
+def test_rejects_ungrounded_ai_output_with_safe_diagnostics(monkeypatch, caplog, offers, reason, field):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response(offers))
     with pytest.raises(SearchError, match="couldn't verify"):
-        ProductStandardizer("key", "model").standardize_and_rank(
+        ProductStandardizer("secret-api-key", "model").standardize_and_rank(
             DEMO_SEARCH_QUERY, [Source("1", "Milk", "https://shop.example/milk", CONTENT)])
+    assert f"reason={reason} offer=1 field={field}" in caplog.text
+    assert "secret-api-key" not in caplog.text
+    assert CONTENT not in caplog.text
+    assert "Organic certified" not in caplog.text
+    assert "$0.01" not in caplog.text
 
 
-@pytest.mark.parametrize("response", [
-    {"status": "incomplete", "output": []},
-    {"status": "completed", "output": [{"type": "message", "content": [{"type": "refusal"}]}]},
-    {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "bad json"}]}]},
+def test_duplicate_source_is_identified_without_logging_source_value(monkeypatch, caplog):
+    monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([offer_data(), offer_data()]))
+    with pytest.raises(SearchError):
+        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+            Source("1", "Milk", "https://shop.example/1", CONTENT),
+            Source("2", "Milk", "https://shop.example/2", CONTENT)])
+    assert "reason=unknown_or_duplicate_source offer=2 field=source_id" in caplog.text
+
+
+@pytest.mark.parametrize("bad_field", ["product_quote", "price_quote", "availability_quote"])
+def test_unverified_offer_does_not_discard_verified_almond_milk(monkeypatch, caplog, bad_field):
+    content = CONTENT.replace("Oat", "Almond")
+    good = offer_data(source_id="2", product_type="almond_milk",
+                      product_quote="Example Unsweetened Almond Milk 1L", size_quote="Almond Milk 1L")
+    bad = {**good, "source_id": "1", bad_field: "invented evidence"}
+    post = MagicMock(return_value=ai_response([bad, good]))
+    monkeypatch.setattr("shopper.search.post_json", post)
+
+    choices = ProductStandardizer("key", "model").standardize_and_rank(
+        "unsweetened almond milk 1L Canada", [
+            Source("1", "Almond Milk", "https://shop.example/1", content),
+            Source("2", "Almond Milk", "https://shop.example/2", content)])
+
+    assert [offer.source.id for offer in choices] == ["2"]
+    assert choices[0].product_type == "almond_milk"
+    assert choices[0].price_quote == "$4.29 CAD"
+    assert "Skipping unverified offer" in caplog.text
+    assert f"reason=quote_not_in_source offer=1 field={bad_field}" in caplog.text
+    assert "invented evidence" not in caplog.text
+    post.assert_called_once()  # Validation must not trigger another paid request.
+
+
+def test_all_unverified_offers_still_fail_and_report_each_reason(monkeypatch, caplog):
+    post = MagicMock(return_value=ai_response([
+        offer_data(product_quote="invented product"),
+        offer_data(source_id="2", price_quote="$0.01 CAD")]))
+    monkeypatch.setattr("shopper.search.post_json", post)
+    with pytest.raises(SearchError, match="couldn't verify"):
+        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+            Source("1", "Milk", "https://shop.example/1", CONTENT),
+            Source("2", "Milk", "https://shop.example/2", CONTENT)])
+    assert "offer=1 field=product_quote" in caplog.text
+    assert "offer=2 field=price_quote" in caplog.text
+    assert "reason=no_verified_offers" in caplog.text
+    post.assert_called_once()
+
+
+def test_rejected_offer_cannot_reuse_its_source_id(monkeypatch, caplog):
+    monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([
+        offer_data(product_quote="invented product"), offer_data()]))
+    with pytest.raises(SearchError):
+        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+            Source("1", "Milk", "https://shop.example/1", CONTENT),
+            Source("2", "Milk", "https://shop.example/2", CONTENT)])
+    assert "reason=unknown_or_duplicate_source offer=2" in caplog.text
+
+
+def test_quote_cannot_join_title_and_content_into_new_evidence(monkeypatch, caplog):
+    monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([
+        offer_data(product_quote="Oat Milk", variant="unknown", variant_quote=None,
+                   size_quote=None, price_quote=None, availability_quote=None)]))
+    with pytest.raises(SearchError):
+        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+            Source("1", "Oat", "https://shop.example/1", "Milk")])
+    assert "reason=quote_not_in_source offer=1 field=product_quote" in caplog.text
+
+
+@pytest.mark.parametrize("response,reason", [
+    ({"status": "incomplete", "output": []}, "response_not_completed"),
+    ({"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}, "output_token_limit"),
+    ({"status": "incomplete", "incomplete_details": {"reason": "content_filter"}}, "content_filtered"),
+    ({"status": "incomplete", "incomplete_details": {"reason": "sensitive-provider-text"}}, "response_not_completed"),
+    ({"status": "completed", "output": [{"type": "message", "content": [
+        {"type": "refusal", "refusal": "sensitive-provider-text"}]}]}, "model_refusal"),
+    ({"status": "completed", "output": [{"type": "message", "content": [
+        {"type": "output_text", "text": "sensitive-provider-text"}]}]}, "invalid_json"),
+    ({"status": "completed", "output": []}, "missing_output_text"),
+    ({"status": "completed", "output": "sensitive-provider-text"}, "malformed_response"),
 ])
-def test_handles_refusal_and_incomplete_ai_response(monkeypatch, response):
+def test_handles_refusal_and_incomplete_ai_response(monkeypatch, caplog, response, reason):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: response)
     with pytest.raises(SearchError):
         ProductStandardizer("key", "model").standardize_and_rank(
             DEMO_SEARCH_QUERY, [Source("1", "Milk", "https://shop.example/milk", CONTENT)])
+    assert f"reason={reason}" in caplog.text
+    assert "sensitive-provider-text" not in caplog.text
+
 
 
 def test_unknown_price_is_explicit_and_empty_ranking_is_valid(monkeypatch):

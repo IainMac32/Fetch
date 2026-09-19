@@ -26,6 +26,14 @@ class SearchError(Exception):
     """Contains a safe message that can be sent to the requesting chat."""
 
 
+class ExtractionValidationError(ValueError):
+    """Diagnostics contain only local labels and offer positions, never provider text."""
+
+    def __init__(self, reason, *, offer=None, field=None):
+        self.reason, self.offer, self.field = reason, offer, field
+        super().__init__(reason)
+
+
 class SearchCancelled(Exception):
     pass
 
@@ -295,7 +303,11 @@ class ProductStandardizer:
             "Use product_type oat_milk, almond_milk, soy_milk or dairy_milk only when the product_quote "
             "explicitly contains that kind of milk; otherwise use other or unknown. "
             "Use a specific variant only when its variant_quote explicitly says so. "
-            "Every non-null quote must be copied verbatim from that source's title or content. "
+            "Every non-null quote must be one contiguous excerpt copied verbatim from that source's title or content. "
+            "Do not assemble a product name from separate headings, remove Markdown between words, "
+            "reorder words, expand abbreviations, or add words from the search query. "
+            "product_quote can be a short excerpt such as 'Almond Milk'; it need not include the full "
+            "brand, variant or size. If no exact excerpt supports the category, use unknown and null. "
             "size_quote must quote the package's liquid volume (include multipack quantities when shown), "
             "not a serving size. price_quote must quote the listed product's price, not a delivery fee. "
             "availability_quote must quote explicit stock or add-to-cart wording, or be null. "
@@ -313,78 +325,118 @@ class ProductStandardizer:
                                                              "content": s.content} for s in sources]})}],
                                   "text": {"format": {"type": "json_schema", "name": "normalized_offers",
                                                       "strict": True, "schema": schema}}})
+        stage = "response"
         try:
-            if data.get("status") != "completed":
-                raise ValueError()
-            texts = [part["text"] for item in data["output"] if item.get("type") == "message"
-                     for part in item["content"] if part.get("type") == "output_text"]
-            extraction = json.loads("".join(texts))
+            extraction = self._read_extraction(data)
+            stage = "offers"
             offers = self._validate(extraction, sources, query)
-            return self._rank(query, offers)
-        except (KeyError, TypeError, ValueError, AttributeError):
+            stage = "ranking"
+            choices = self._rank(query, offers)
+            LOG.info("Validated %d offers; selected %d matches", len(offers), len(choices))
+            return choices
+        except ExtractionValidationError as exc:
+            LOG.warning("Product extraction rejected: reason=%s offer=%s field=%s",
+                        exc.reason, exc.offer or "-", exc.field or "-")
             raise SearchError("I couldn't verify the AI's recommendations. Text SEARCH to try again.") from None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            LOG.warning("Product extraction rejected: reason=malformed_%s", stage)
+            raise SearchError("I couldn't verify the AI's recommendations. Text SEARCH to try again.") from None
+
+    @staticmethod
+    def _read_extraction(data):
+        if data.get("status") != "completed":
+            details = data.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            # Only log known codes; arbitrary provider values may contain sensitive text.
+            code = {"max_output_tokens": "output_token_limit", "content_filter": "content_filtered"}.get(
+                reason if isinstance(reason, str) else None, "response_not_completed")
+            raise ExtractionValidationError(code)
+        texts = []
+        for item in data["output"]:
+            if item.get("type") != "message":
+                continue
+            for part in item["content"]:
+                if part.get("type") == "refusal":
+                    raise ExtractionValidationError("model_refusal")
+                if part.get("type") == "output_text":
+                    texts.append(part["text"])
+        if not texts:
+            raise ExtractionValidationError("missing_output_text")
+        try:
+            return json.loads("".join(texts))
+        except json.JSONDecodeError:
+            raise ExtractionValidationError("invalid_json") from None
 
     @staticmethod
     def _validate(ranking, sources, query):
         if not isinstance(ranking, dict) or set(ranking) != {"offers"}:
-            raise ValueError()
+            raise ExtractionValidationError("invalid_offers_object")
         items = ranking["offers"]
         if not isinstance(items, list) or len(items) > len(sources):
-            raise ValueError()
+            raise ExtractionValidationError("invalid_offer_count")
         by_id, seen, offers = {s.id: s for s in sources}, set(), []
-        for item in items:
+        for position, item in enumerate(items, 1):
             fields = {"source_id", "product_type", "product_quote", "variant", "variant_quote",
                       "size_quote", "price_quote", "availability_quote"}
             if not isinstance(item, dict) or set(item) != fields:
-                raise ValueError()
+                raise ExtractionValidationError("invalid_offer_fields", offer=position)
             source_id = item["source_id"]
             if not isinstance(source_id, str) or source_id not in by_id or source_id in seen:
-                raise ValueError()
-            source = by_id[source_id]
-            product_type, variant = item["product_type"], item["variant"]
-            if product_type not in PRODUCT_TYPES or variant not in VARIANTS:
-                raise ValueError()
-
-            text = " ".join((source.title + " " + source.content).split())
-            quotes = {}
-            for key, limit in (("product_quote", 180), ("variant_quote", 120), ("size_quote", 100),
-                               ("price_quote", 100), ("availability_quote", 120)):
-                quote = item[key]
-                if quote is not None:
-                    if not isinstance(quote, str) or not quote.strip() or len(quote) > limit:
-                        raise ValueError()
-                    quote = " ".join(quote.split())
-                    if quote.casefold() not in text.casefold():
-                        raise ValueError()
-                quotes[key] = quote
-
-            if product_type in PRODUCT_TYPES[:4]:
-                product_quote = quotes["product_quote"]
-                if not product_quote or not _category_is_evidenced(product_type, product_quote):
-                    raise ValueError()
-
-            variant_quote = quotes["variant_quote"]
-            if variant == "unknown":
-                if variant_quote:
-                    raise ValueError()
-            elif not variant_quote or not _variant_is_evidenced(variant, variant_quote):
-                raise ValueError()
-
-            size_quote, price_quote = quotes["size_quote"], quotes["price_quote"]
-            price_amount, currency = parse_price(price_quote)
-            availability_quote = quotes["availability_quote"]
-            availability = availability_from_quote(availability_quote)
-            if availability_quote and availability == "unknown":
-                raise ValueError()
+                raise ExtractionValidationError("unknown_or_duplicate_source", offer=position, field="source_id")
             seen.add(source_id)
-            offers.append(ProductOffer(
-                source=source, product_type=product_type, variant=variant,
-                match_quote=quotes["product_quote"] or "", variant_quote=variant_quote,
-                size_quote=size_quote, size_ml=parse_size_ml(size_quote),
-                price_quote=price_quote, price_amount=price_amount, currency=currency,
-                availability=availability, availability_quote=availability_quote,
-            ))
+            try:
+                offers.append(ProductStandardizer._validate_offer(item, by_id[source_id], position))
+            except ExtractionValidationError as exc:
+                LOG.warning("Skipping unverified offer: reason=%s offer=%s field=%s",
+                            exc.reason, exc.offer, exc.field or "-")
+        if items and not offers:
+            raise ExtractionValidationError("no_verified_offers")
         return offers
+
+    @staticmethod
+    def _validate_offer(item, source, position):
+        product_type, variant = item["product_type"], item["variant"]
+        if product_type not in PRODUCT_TYPES or variant not in VARIANTS:
+            raise ExtractionValidationError("invalid_category_or_variant", offer=position)
+
+        evidence = [" ".join(text.split()).casefold() for text in (source.title, source.content)]
+        quotes = {}
+        for key, limit in (("product_quote", 180), ("variant_quote", 120), ("size_quote", 100),
+                           ("price_quote", 100), ("availability_quote", 120)):
+            quote = item[key]
+            if quote is not None:
+                if not isinstance(quote, str) or not quote.strip() or len(quote) > limit:
+                    raise ExtractionValidationError("invalid_quote", offer=position, field=key)
+                quote = " ".join(quote.split())
+                if not any(quote.casefold() in text for text in evidence):
+                    raise ExtractionValidationError("quote_not_in_source", offer=position, field=key)
+            quotes[key] = quote
+
+        if product_type in PRODUCT_TYPES[:4]:
+            product_quote = quotes["product_quote"]
+            if not product_quote or not _category_is_evidenced(product_type, product_quote):
+                raise ExtractionValidationError("category_not_evidenced", offer=position, field="product_quote")
+
+        variant_quote = quotes["variant_quote"]
+        if variant == "unknown":
+            if variant_quote:
+                raise ExtractionValidationError("unknown_variant_has_quote", offer=position, field="variant_quote")
+        elif not variant_quote or not _variant_is_evidenced(variant, variant_quote):
+            raise ExtractionValidationError("variant_not_evidenced", offer=position, field="variant_quote")
+
+        size_quote, price_quote = quotes["size_quote"], quotes["price_quote"]
+        price_amount, currency = parse_price(price_quote)
+        availability_quote = quotes["availability_quote"]
+        availability = availability_from_quote(availability_quote)
+        if availability_quote and availability == "unknown":
+            raise ExtractionValidationError("availability_not_recognized", offer=position, field="availability_quote")
+        return ProductOffer(
+            source=source, product_type=product_type, variant=variant,
+            match_quote=quotes["product_quote"] or "", variant_quote=variant_quote,
+            size_quote=size_quote, size_ml=parse_size_ml(size_quote),
+            price_quote=price_quote, price_amount=price_amount, currency=currency,
+            availability=availability, availability_quote=availability_quote,
+        )
 
     @staticmethod
     def _rank(query, offers):
