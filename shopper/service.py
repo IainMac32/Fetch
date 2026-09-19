@@ -107,7 +107,7 @@ class SearchService:
     def _run_search(self, job):
         notify = lambda text: job.notify(self.messenger, text)
         try:
-            notify(f'Searching for "{DEMO_SEARCH_QUERY}". I’ll read up to 10 web results and compare the best matches.')
+            notify(f'Searching for "{DEMO_SEARCH_QUERY}" on DoorDash, Uber Eats, SkipTheDishes, Instacart and Walmart. I’ll read up to 10 pages and compare the best matches.')
             report = self.searcher.run(DEMO_SEARCH_QUERY, cancelled=job.cancelled, progress=job.set_message)
             job.set_message(f"Search complete: {len(report.choices)} matches from {report.fetched} readable pages. Text SEARCH to run again.")
             notify(report.as_text())

@@ -41,8 +41,8 @@ def api(monkeypatch):
     def post(url, **kwargs):
         calls.append((url, kwargs))
         if url.endswith("/search"):
-            data = {"results": [{"url": f"https://shop.example/product/{i}", "title": f"Oat milk {i}"}
-                                for i in range(12)]}
+            data = {"results": [{"url": f"https://www.walmart.ca/product/{i}", "title": f"Oat milk {i}"}
+                                for i in range(30)]}
         elif url.endswith("/fetch"):
             data = {"statusCode": 200, "content": CONTENT}
         elif url.endswith("/responses"):
@@ -59,18 +59,18 @@ def api(monkeypatch):
 
 def test_search_then_fetch_then_rank_uses_real_provider_contracts(api):
     report = GrocerySearch(SETTINGS).run()
-    assert report.found == report.fetched == 10
+    assert report.found == 25 and report.fetched == 10
     assert len(report.choices) == 1
-    assert "https://shop.example/product/0" in report.as_text()
+    assert "https://www.walmart.ca/product/0" in report.as_text()
     assert "Listed price: $4.29 CAD ($4.29/L)" in report.as_text()
     assert api[0][0] == "https://api.browserbase.com/v1/search"
-    assert api[0][1]["json"] == {"query": DEMO_SEARCH_QUERY, "numResults": 10}
+    assert api[0][1]["json"] == {"query": DEMO_SEARCH_QUERY, "numResults": 25}
     assert api[0][1]["headers"] == {"X-BB-API-Key": "bb-test"}
     assert len(api) == 12
     for url, args in api[1:-1]:
         assert url == "https://api.browserbase.com/v1/fetch"
         assert args["json"]["format"] == "markdown"
-        assert args["json"]["allowRedirects"] is True
+        assert args["json"]["allowRedirects"] is False
     url, args = api[-1]
     assert url == "https://api.openai.com/v1/responses"
     assert args["headers"] == {"Authorization": "Bearer openai-test"}
@@ -88,16 +88,16 @@ def test_search_then_fetch_then_rank_uses_real_provider_contracts(api):
 
 
 def test_search_deduplicates_and_rejects_non_public_urls(monkeypatch):
-    urls = ["https://shop.example/milk#top", "https://shop.example/milk#bottom", "file:///etc/passwd",
-            "http://127.0.0.1/admin", "http://localhost/a", "https://user:pass@shop.example/a",
-            "http://192.168.1.1/", "https://shop.local/a", "https://shop.example:1234/a"]
+    urls = ["https://www.walmart.ca/milk#top", "https://www.walmart.ca/milk#bottom", "file:///etc/passwd",
+            "http://127.0.0.1/admin", "http://localhost/a", "https://user:pass@www.walmart.ca/a",
+            "http://192.168.1.1/", "https://shop.local/a", "https://www.walmart.ca:1234/a"]
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: {
         "results": [{"url": url, "title": "Milk"} for url in urls]})
-    assert BrowserbaseWeb("key").search("milk") == [Source("1", "Milk", "https://shop.example/milk")]
+    assert BrowserbaseWeb("key").search("milk") == [Source("1", "Milk", "https://www.walmart.ca/milk")]
 
 
 def test_fetch_checks_target_status_and_caps_content(monkeypatch):
-    source = Source("1", "Milk", "https://shop.example/milk")
+    source = Source("1", "Milk", "https://www.walmart.ca/milk")
     mock = MagicMock(return_value={"statusCode": 200, "content": "x" * (PAGE_CHAR_LIMIT + 100)})
     monkeypatch.setattr("shopper.search.post_json", mock)
     assert len(BrowserbaseWeb("key").fetch(source).content) == PAGE_CHAR_LIMIT
@@ -118,8 +118,8 @@ def test_partial_fetch_failure_only_ranks_readable_pages(api):
 
     search.web.fetch = fetch
     report = search.run()
-    assert report.found == 10 and report.fetched == 1
-    assert "Read 1 of 10" in report.as_text()
+    assert report.found == 25 and report.fetched == 1
+    assert "Read 1 of 25" in report.as_text()
     assert len(json.loads(api[-1][1]["json"]["input"][1]["content"])["sources"]) == 1
 
 
@@ -128,7 +128,7 @@ def test_empty_search_and_failed_fetches_do_not_call_ai(api):
     search.standardizer = MagicMock()
     search.web.search = MagicMock(return_value=[])
     assert search.run().choices == []
-    search.web.search.return_value = [Source("1", "Milk", "https://shop.example/milk")]
+    search.web.search.return_value = [Source("1", "Milk", "https://www.walmart.ca/milk")]
     search.web.fetch = MagicMock(side_effect=SearchError("unreadable"))
     with pytest.raises(SearchError, match="couldn't read"):
         search.run()
