@@ -6,20 +6,31 @@ from flask import Flask, request, abort
 import requests
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
+import json
+from pymongo.errors import DuplicateKeyError
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
 # Config — all pulled from environment variables. Don't hardcode secrets.
 # ---------------------------------------------------------------------------
-LINQ_API_KEY = "linq_jvgXUWb9aTGVbjizkIC0A3W4ATr7Jaxx"
-MONGO_URI = "mongodb+srv://iainhmacdonald_db_user:oOcXTTeobAdpM1EF@cluster0.ykdex3l.mongodb.net/?appName=Cluster0"
-BASE_URL = "https://reassign-rogue-swaddling.ngrok-free.dev"  # e.g. https://reassign-rogue-swaddling.ngrok-free.dev
+LINQ_API_KEY = os.getenv("LINQ_API_KEY")
+MONGO_URI = os.getenv("MONGO_URI")
+BASE_URL = os.getenv("BASE_URL")  # e.g. https://reassign-rogue-swaddling.ngrok-free.dev
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 TOKEN_TTL_MINUTES = 5
 
+import certifi
 client = MongoClient(MONGO_URI, server_api=ServerApi("1"))
 db = client["myAppDB"]
+orders = db["orders"]
 users = db["users"]
 users.create_index("PhoneNumber", unique=True)
 users.create_index("cred_token", unique=True, sparse=True)
@@ -28,9 +39,150 @@ users.create_index("cred_token", unique=True, sparse=True)
 # ---------------------------------------------------------------------------
 # Messaging
 # ---------------------------------------------------------------------------
+def classify_doordash_instruction(userphone, message):
+    history = get_recent_history(userphone)
+    history_text = "\n".join(f'{h["role"]}: {h["text"]}' for h in history)
+
+    past_orders = get_past_orders(userphone)
+    if past_orders:
+        past_orders_text = "\n".join(
+            f'- {o["order"]} (ordered {o["createdAt"].strftime("%Y-%m-%d")})'
+            for o in past_orders
+        )
+    else:
+        past_orders_text = "(no past orders yet)"
+
+    prompt = f"""
+    You are a friendly, casual texting assistant for a DoorDash ordering service.
+    You're chatting with a real person over iMessage — keep replies short, warm,
+    and natural, like a helpful friend texting back.
+
+    Here is this user's past order history (most recent first), which you can
+    use to speed things up — e.g. if they order something they've ordered
+    before, offer to repeat their usual instead of asking from scratch:
+
+    {past_orders_text}
+
+    You are having an ONGOING conversation. Here is the recent history
+    (oldest first). The last line is the newest message from the user:
+
+    {history_text}
+    user: {message}
+
+    Your job: figure out if you now have EVERYTHING needed to place a real
+    DoorDash order. A complete order needs, at minimum:
+    - the restaurant or store
+    - specific item(s) — not just "pizza" but what kind
+    - size/quantity for each item where relevant
+    - any must-have modifiers (e.g. toppings) if the item implies a choice
+
+    Categories:
+
+    DOORDASH_ACTION
+    Use ONLY when the conversation now has enough specific detail to actually
+    place the order with no more questions needed.
+
+    CHAT_RESPONSE
+    Use this for greetings, thanks, general questions, OR when the user wants
+    to order something but you're still missing details. In that case, ask ONE
+    short, casual, specific follow-up question for the most important missing
+    piece — don't ask for everything at once. If their past orders suggest an
+    obvious match (e.g. they always order the same thing from this restaurant),
+    offer that as the question instead of asking generically.
+
+    Examples:
+
+    history: (empty)
+    past orders: (none)
+    user: "I want to order pizza from dominos"
+    => CHAT_RESPONSE, reply: "Nice, Domino's it is! What kind of pizza and what size?"
+
+    history:
+    user: I want to order pizza from dominos
+    assistant: Nice, Domino's it is! What kind of pizza and what size?
+    user: "large pepperoni"
+    => DOORDASH_ACTION, action_instruction: "Order a large pepperoni pizza from Domino's"
+
+    history: (empty)
+    past orders:
+    - Order a large pepperoni pizza from Domino's (ordered 2026-09-10)
+    user: "I want pizza from dominos again"
+    => CHAT_RESPONSE, reply: "Want the usual — large pepperoni? 🍕"
+
+    history:
+    assistant: Want the usual — large pepperoni? 🍕
+    user: "yeah"
+    => DOORDASH_ACTION, action_instruction: "Order a large pepperoni pizza from Domino's"
+
+    user: "order"
+    => CHAT_RESPONSE, reply: "Hey! What are you in the mood for? 🍔"
+
+    user: "Thanks"
+    => CHAT_RESPONSE, reply: "Anytime! 🙌"
+
+    Return ONLY valid JSON with this exact shape:
+
+    {{
+        "category": "DOORDASH_ACTION" or "CHAT_RESPONSE",
+        "action_instruction": "complete order instruction if DOORDASH_ACTION, otherwise null",
+        "reply": "short, friendly, natural text to send the user",
+        "reason": "short explanation"
+    }}
+    """
+
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "gpt-5.6-terra",
+            "input": prompt
+        },
+        timeout=30
+    )
+
+    print("Status:", response.status_code)
+
+    if response.status_code != 200:
+        print(response.text)
+        return None
+
+    data = response.json()
+    result = data["output"][0]["content"][0]["text"]
+    return json.loads(result)
+
+#memory
+conversations = db["conversations"]
+
+def get_recent_history(userphone, limit=10):
+    convo = conversations.find_one({"PhoneNumber": userphone})
+    if not convo:
+        return []
+    return convo.get("history", [])[-limit:]
+
+def append_history(userphone, role, text):
+    conversations.update_one(
+        {"PhoneNumber": userphone},
+        {
+            "$push": {"history": {"role": role, "text": text, "at": datetime.now(timezone.utc)}},
+            "$set": {"updatedAt": datetime.now(timezone.utc)},
+        },
+        upsert=True,
+    )
+
+#past orders
+def get_past_orders(userphone, limit=5):
+    cursor = orders.find({"PhoneNumber": userphone}).sort("createdAt", -1).limit(limit)
+    return list(cursor)
+
+# ---------------------------------------------------------------------------
+# Messaging
+# ---------------------------------------------------------------------------
 def send_message(to_phone, text):
     data = {
-        "from": "+16462397830",
+        "from": "+14046630503",
         "to": [to_phone],
         "message": {
             "parts": [
@@ -179,12 +331,31 @@ def collect_submit(token):
 # ---------------------------------------------------------------------------
 # Webhook
 # ---------------------------------------------------------------------------
+processed_messages = db["processed_messages"]
+processed_messages.create_index("message_id", unique=True)
+
 @app.route("/linq-webhook", methods=["POST"])
 def linq_webhook():
     payload = request.json
+    data = payload.get("data", {})
 
-    parts = payload.get("data", {}).get("parts", [])
-    userphone = payload["data"]["sender_handle"]["handle"]
+    # Only process genuine inbound messages from the customer.
+    # This drops echoes of our own bot replies.
+    if data.get("direction") != "inbound":
+        return "", 200
+    if data.get("sender_handle", {}).get("is_me"):
+        return "", 200
+
+    message_id = data.get("id")
+    if message_id:
+        try:
+            processed_messages.insert_one({"message_id": message_id})
+        except DuplicateKeyError:
+            print(f"Duplicate webhook for message_id={message_id}, skipping")
+            return "", 200
+
+    parts = data.get("parts", [])
+    userphone = data["sender_handle"]["handle"]
 
     for part in parts:
         if part.get("type") != "text":
@@ -195,14 +366,41 @@ def linq_webhook():
 
         user = users.find_one({"PhoneNumber": userphone})
 
-        # Normal message handling
-        if "order" in message.lower():
-            print("Sending a response back to the user...")
+        has_creds = user and user.get("doordashusername") and user.get("doordashpassword")
 
-            has_creds = user and user.get("doordashusername") and user.get("doordashpassword")
+        # Route to the ordering flow if this message mentions "order",
+        # OR if the user is already mid-conversation about an order
+        # (so follow-up replies like "large pepperoni" still get handled).
+        in_progress = bool(get_recent_history(userphone))
+        wants_order = "order" in message.lower() or in_progress
 
+        if wants_order:
             if has_creds:
-                send_message(userphone, "Account details already present please continue")
+                result = classify_doordash_instruction(userphone, message)
+                print("Classification result:", result)
+
+                if result:
+                    append_history(userphone, "user", message)
+                    append_history(userphone, "assistant", result["reply"])
+                    send_message(userphone, result["reply"])
+
+                    if result["category"] == "DOORDASH_ACTION":
+                        orders.insert_one({
+                            "PhoneNumber": userphone,
+                            "order": result["action_instruction"],
+                            "status": "pending",
+                            "createdAt": datetime.now(timezone.utc),
+                        })
+                        # hand result["action_instruction"] to your actual
+                        # ordering logic here once that's built
+                        conversations.update_one(
+                            {"PhoneNumber": userphone},
+                            {"$set": {"history": []}},  # reset for next order
+                        )
+
+                        
+                else:
+                    send_message(userphone, "Sorry, something went wrong — try again?")
             else:
                 link = issue_credential_link(userphone)
                 send_message(
@@ -210,10 +408,9 @@ def linq_webhook():
                     f"To link your DoorDash account, tap this secure link: {link}\n"
                     f"It expires in {TOKEN_TTL_MINUTES} minutes.",
                 )
-            continue
+        break
 
     return "", 200
-
 
 @app.route("/", methods=["GET"])
 def home():
