@@ -1,7 +1,7 @@
 from browserbase import Browserbase
 from playwright.sync_api import sync_playwright
 
-BROWSERBASE_API_KEY = ""
+BROWSERBASE_API_KEY = "bb_live_8FGf5QcJk0D4pbeZpW4Slc4KKUg"
 
 bb = Browserbase(api_key=BROWSERBASE_API_KEY)
 
