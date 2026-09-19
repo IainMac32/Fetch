@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fetch</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <aside class="phone-panel">
+      <div class="phone-intro">
+        <span class="eyebrow">Preview</span>
+        <h1>Fetch</h1>
+        <p>See how your food preferences read inside the message flow.</p>
+      </div>
+
+      <div class="iphone">
+        <div class="iphone-notch"></div>
+        <div class="iphone-statusbar">
+          <span id="clock">9:41</span>
+          <span class="statusbar-icons">•••</span>
+        </div>
+        <div class="imessage-header">
+          <div class="contact-avatar">F</div>
+          <div class="contact-name">Fetch Concierge</div>
+        </div>
+        <div class="imessage-thread" id="imessage-thread"></div>
+        <div class="imessage-inputbar">
+          <input type="text" id="imessage-input" placeholder="Text Message" />
+          <button id="imessage-send" aria-label="Send message">&#8593;</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace-panel">
+      <header class="panel-card hero-card">
+        <span class="eyebrow">Meal planning workspace</span>
+        <h2>Fetch</h2>
+        <p>Capture dietary filters, track favorite meals, and keep a cleaner day-by-day food log.</p>
+      </header>
+
+      <section class="panel-card profile-card">
+        <div class="section-heading">
+          <div>
+            <span class="section-kicker">Filters</span>
+            <h2>Taste Profile</h2>
+          </div>
+          <p>One block for what is allowed, loved, and off-limits.</p>
+        </div>
+
+        <section class="profile-section">
+          <div class="section-inline">
+            <h3>Dietary Filters</h3>
+            <span class="pill-count" id="dietary-count">0 selected</span>
+          </div>
+          <div class="checkbox-grid" id="dietary-checkboxes"></div>
+        </section>
+
+        <section class="profile-section">
+          <h3>Selected Restrictions</h3>
+          <div class="chip-list" id="dietary-chips"></div>
+          <div class="add-row">
+            <input id="dietary-input" placeholder="Add a custom restriction" />
+            <button class="btn-add" id="dietary-add-btn">Add</button>
+          </div>
+        </section>
+
+        <div class="profile-columns">
+          <section class="profile-section list-section">
+            <h3>Favourite Foods</h3>
+            <ul class="item-list" id="favourite-list"></ul>
+            <div class="add-row">
+              <input id="favourite-input" placeholder="Add a favourite food" />
+              <button class="btn-add" id="favourite-add-btn">Add</button>
+            </div>
+          </section>
+
+          <section class="profile-section list-section">
+            <h3>Avoid</h3>
+            <ul class="item-list" id="avoid-list"></ul>
+            <div class="add-row">
+              <input id="avoid-input" placeholder="Add a food to avoid" />
+              <button class="btn-add" id="avoid-add-btn">Add</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="panel-card calendar-card">
+        <div class="section-heading calendar-heading">
+          <div>
+            <span class="section-kicker">Planner</span>
+            <h2>Food Calendar</h2>
+          </div>
+          <p><span id="calendar-entry-count">0</span> saved days this month</p>
+        </div>
+
+        <div class="calendar-shell">
+          <div class="calendar-main">
+            <div class="calendar-header">
+              <button class="cal-nav" id="cal-prev" aria-label="Previous month">&#8249;</button>
+              <h3 id="cal-month-label"></h3>
+              <button class="cal-nav" id="cal-next" aria-label="Next month">&#8250;</button>
+            </div>
+            <div class="calendar-weekdays">
+              <span>S</span><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span>
+            </div>
+            <div class="calendar-grid" id="calendar-grid"></div>
+          </div>
+
+          <aside class="calendar-detail" id="calendar-detail">
+            <span class="detail-kicker">Selected date</span>
+            <h3 id="calendar-detail-date"></h3>
+            <p id="calendar-detail-label">Add a note for meals, cravings, prep, or leftovers.</p>
+            <textarea id="calendar-detail-input" placeholder="Add food notes for this date"></textarea>
+            <div class="detail-actions">
+              <button class="btn-add" id="calendar-save-btn">Save</button>
+              <button class="btn-remove" id="calendar-clear-btn">Clear</button>
+            </div>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
