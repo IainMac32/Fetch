@@ -1,4 +1,4 @@
-"""Run the real search pipeline locally, without LINQ, MongoDB or a login."""
+"""Run the real search pipeline locally, without LINQ."""
 
 import argparse
 import sys

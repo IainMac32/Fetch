@@ -1,1 +1,1 @@
-"""MessageShopper's DoorDash connection flow."""
+"""MessageShopper's LINQ grocery search flow."""

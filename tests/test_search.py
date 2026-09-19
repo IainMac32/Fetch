@@ -13,8 +13,8 @@ from shopper.config import Settings
 from shopper.linq import IncomingMessage
 from shopper.search import (DEMO_SEARCH_QUERY, PAGE_CHAR_LIMIT, BrowserbaseWeb, GrocerySearch,
                             ProductStandardizer, SearchCancelled, SearchError, SearchReport, Source)
-from shopper.service import ConnectionService
-from test_flow import SECRET, headers, memory_store, payload
+from shopper.service import SearchService
+from test_flow import SECRET, headers, payload
 
 CONTENT = "Example Unsweetened Oat Milk 1L. Listed price $4.29 CAD. Available online in Canada."
 SETTINGS = Settings(browserbase_api_key="bb-test", openai_api_key="openai-test",
@@ -199,13 +199,12 @@ def test_missing_openai_key_fails_before_any_paid_request(api):
     assert api == []
 
 
-def test_search_environment_does_not_require_doordash_credentials(monkeypatch):
+def test_search_environment_only_requires_search_and_messaging_keys(monkeypatch):
     monkeypatch.setattr("shopper.config.load_dotenv", lambda: None)
     with patch.dict(os.environ, {"BROWSERBASE_API_KEY": "bb-test", "OPENAI_API_KEY": "ai-test",
                                 "LINQ_API_KEY": "linq-test", "LINQ_WEBHOOK_SECRET": SECRET,
-                                "DEMO_USER_HANDLE": "+15550000001", "PUBLIC_BASE_URL": "https://shop.example"}, clear=True):
+                                "DEMO_USER_HANDLE": "+15550000001"}, clear=True):
         settings = Settings.from_env()
-    assert settings.credential_encryption_key == ""
     assert settings.openai_api_key == "ai-test"
 
 
@@ -258,12 +257,11 @@ def dispatch(service, text, *, chat="chat-a", handle=SETTINGS.demo_user_handle):
 
 
 def test_signed_search_webhook_runs_without_login_and_deduplicates(api):
-    messenger, runner, sent = MagicMock(), MagicMock(), threading.Event()
+    messenger, sent = MagicMock(), threading.Event()
     messenger.send.side_effect = lambda chat, text: sent.set() if "Best matches" in text else None
-    store = memory_store(key="")
-    service = ConnectionService(SETTINGS, store, messenger, runner)
+    service = SearchService(SETTINGS, messenger)
     try:
-        client = create_app(SETTINGS, store=store, service=service).test_client()
+        client = create_app(SETTINGS, service=service).test_client()
         body = json.dumps(payload(text=" SEARCH ")).encode()
         assert client.post("/linq-webhook", data=body, headers=headers(body)).status_code == 200
         assert client.post("/linq-webhook", data=body, headers=headers(body)).status_code == 200
@@ -271,15 +269,13 @@ def test_signed_search_webhook_runs_without_login_and_deduplicates(api):
         assert service.search_job.finished.wait(3)
         assert sum(url.endswith("/search") for url, _ in api) == 1
         assert all(call.args[0] == "chat-a" for call in messenger.send.call_args_list)
-        runner.run.assert_not_called()
-        assert not service.jobs and not service.tokens
     finally:
         service.close()
 
 
 def test_active_search_handles_duplicate_status_cancel_and_chat_isolation():
     entered, release = threading.Event(), threading.Event()
-    searcher, messenger, runner = MagicMock(), MagicMock(), MagicMock()
+    searcher, messenger = MagicMock(), MagicMock()
 
     def run(query, *, cancelled, progress):
         assert query == DEMO_SEARCH_QUERY
@@ -289,7 +285,7 @@ def test_active_search_handles_duplicate_status_cancel_and_chat_isolation():
         return SearchReport(query, 1, 1, [])
 
     searcher.run.side_effect = run
-    service = ConnectionService(SETTINGS, MagicMock(), messenger, runner, searcher=searcher)
+    service = SearchService(SETTINGS, messenger, searcher=searcher)
     try:
         dispatch(service, "SEARCH", handle="+15550000002")
         assert service.search_job is None
@@ -324,7 +320,7 @@ def test_concurrent_starts_share_one_search_and_close_cancels_it():
         raise SearchCancelled()
 
     searcher.run.side_effect = run
-    service = ConnectionService(SETTINGS, MagicMock(), messenger, MagicMock(), searcher=searcher)
+    service = SearchService(SETTINGS, messenger, searcher=searcher)
     try:
         with ThreadPoolExecutor(max_workers=8) as pool:
             jobs = list(pool.map(lambda _: service.start_search("chat-a"), range(8)))
@@ -340,7 +336,7 @@ def test_concurrent_starts_share_one_search_and_close_cancels_it():
 def test_failed_search_releases_worker_and_allows_retry():
     searcher, messenger = MagicMock(), MagicMock()
     searcher.run.side_effect = [SearchError("Browserbase Search is unavailable."), SearchReport("milk", 0, 0, [])]
-    service = ConnectionService(SETTINGS, MagicMock(), messenger, MagicMock(), searcher=searcher)
+    service = SearchService(SETTINGS, messenger, searcher=searcher)
     try:
         first = service.start_search("chat-a")
         assert first.finished.wait(3)
@@ -355,7 +351,7 @@ def test_failed_search_releases_worker_and_allows_retry():
 
 def test_missing_search_configuration_sends_setup_reply_without_job(api):
     messenger = MagicMock()
-    service = ConnectionService(replace(SETTINGS, openai_api_key=""), MagicMock(), messenger, MagicMock())
+    service = SearchService(replace(SETTINGS, openai_api_key=""), messenger)
     try:
         dispatch(service, "SEARCH")
         assert service.search_job is None
