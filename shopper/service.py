@@ -8,10 +8,35 @@ from dataclasses import dataclass, field
 from queue import Full, Queue
 
 from .browser import LoginCancelled, LoginExpired
+from .search import DEMO_SEARCH_QUERY, GrocerySearch, SearchCancelled, SearchError
 
 LOG = logging.getLogger(__name__)
-HELP = "Text CONNECT to connect your DoorDash account, STATUS to check progress, or CANCEL to stop."
+HELP = "Text SEARCH to try the grocery web search demo, STATUS to check progress, or CANCEL to stop."
 DEMO_USER_ID = "demo-user"
+
+
+@dataclass
+class SearchJob:
+    chat_id: str
+    message: str = "Starting grocery search…"
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
+    finished: threading.Event = field(default_factory=threading.Event, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def set_message(self, message):
+        with self.lock:
+            if not self.cancelled.is_set():
+                self.message = message
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled.set()
+            self.message = "Search cancelled. Text SEARCH to start again."
+
+    def notify(self, messenger, text):
+        with self.lock:
+            if not self.cancelled.is_set():
+                messenger.send(self.chat_id, text)
 
 
 @dataclass
@@ -94,12 +119,15 @@ class LoginJob:
 class ConnectionService:
     """Bounded, single-process prototype workers; never share Playwright objects."""
 
-    def __init__(self, settings, store, messenger, runner):
+    def __init__(self, settings, store, messenger, runner, *, searcher=None):
         self.settings, self.store, self.messenger, self.runner = settings, store, messenger, runner
         self.lock = threading.RLock()
         self.jobs = {}
         self.tokens = {}
         self.closed = False
+        self.searcher = searcher if searcher is not None else GrocerySearch(settings)
+        self.search_job = None
+        self.search_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grocery-search")
         self.browser_pool = ThreadPoolExecutor(max_workers=settings.max_sessions, thread_name_prefix="doordash")
         self.message_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="linq")
         self.message_slots = threading.BoundedSemaphore(32)
@@ -123,17 +151,25 @@ class ConnectionService:
             command = incoming.text.strip().lower()
             with self.lock:
                 job = self.jobs.get(DEMO_USER_ID)
-            if job and not job.finished_at and job.chat_id != incoming.chat_id:
+                search_job = self.search_job
+            if ((job and not job.finished_at and job.chat_id != incoming.chat_id)
+                    or (search_job and not search_job.finished.is_set() and search_job.chat_id != incoming.chat_id)):
                 self.messenger.send(incoming.chat_id, "This prototype is connected to one demo iMessage chat.")
                 return
             if command in {"stop", "cancel", "unsubscribe", "quit", "end", "opt out", "optout"}:
                 if job:
                     job.cancelled.set()
+                if search_job:
+                    search_job.cancel()
                 return
-            if command in {"connect", "login", "sign in", "connect doordash"}:
+            if command == "search":
+                self.start_search(incoming.chat_id)
+            elif command in {"connect", "login", "sign in", "connect doordash"}:
                 self.start(incoming.user_key, incoming.chat_id)
             elif command == "status":
-                if job:
+                if search_job and search_job.chat_id == incoming.chat_id:
+                    self.messenger.send(incoming.chat_id, search_job.message)
+                elif job and job.chat_id == incoming.chat_id:
                     self.messenger.send(incoming.chat_id, job.snapshot()["message"])
                 else:
                     self.messenger.send(incoming.chat_id, HELP)
@@ -145,6 +181,47 @@ class ConnectionService:
         finally:
             self.message_slots.release()
 
+    def start_search(self, chat_id):
+        try:
+            self.searcher.check_config()
+        except SearchError as exc:
+            self.messenger.send(chat_id, str(exc))
+            return None
+        with self.lock:
+            if self.closed:
+                return None
+            existing = self.search_job
+            login = self.jobs.get(DEMO_USER_ID)
+            if existing and not existing.finished.is_set():
+                reply = (existing.message if existing.chat_id == chat_id
+                         else "This prototype is connected to one demo iMessage chat.")
+            elif login and not login.finished_at:
+                reply = "Finish or CANCEL the current connection before starting a search."
+            else:
+                job = SearchJob(chat_id)
+                self.search_job = job
+                self.search_pool.submit(self._run_search, job)
+                return job
+        self.messenger.send(chat_id, reply)
+        return None
+
+    def _run_search(self, job):
+        notify = lambda text: job.notify(self.messenger, text)
+        try:
+            notify(f'Searching for "{DEMO_SEARCH_QUERY}". I’ll read up to 10 web results and compare the best matches.')
+            report = self.searcher.run(DEMO_SEARCH_QUERY, cancelled=job.cancelled, progress=job.set_message)
+            job.set_message(f"Search complete: {len(report.choices)} matches from {report.fetched} readable pages. Text SEARCH to run again.")
+            notify(report.as_text())
+        except SearchCancelled:
+            job.cancel()
+        except Exception as exc:
+            LOG.error("Grocery search failed (%s)", type(exc).__name__)
+            message = str(exc) if isinstance(exc, SearchError) else "Search couldn't finish. Text SEARCH to try again."
+            job.set_message(message)
+            self._notify_safely(notify, message)
+        finally:
+            job.finished.set()
+
     def start(self, user_key, chat_id):
         user_key = DEMO_USER_ID
         with self.lock:
@@ -152,7 +229,11 @@ class ConnectionService:
                 return None
             self._prune()
             existing = self.jobs.get(user_key)
-            if existing and not existing.finished_at:
+            if self.search_job and not self.search_job.finished.is_set():
+                reply, job = "Finish or CANCEL the current search before connecting an account.", None
+            elif not self.settings.credential_encryption_key:
+                reply, job = "Account connection isn't configured. Text SEARCH to search the web.", None
+            elif existing and not existing.finished_at:
                 if existing.chat_id != chat_id:
                     reply, job = "This prototype is connected to one demo iMessage chat.", None
                 else:
@@ -163,6 +244,7 @@ class ConnectionService:
             elif sum(not item.finished_at for item in self.jobs.values()) >= self.settings.max_sessions:
                 reply, job = "All browsers are busy. Please text CONNECT again in a few minutes.", None
             else:
+                self.search_job = None
                 job = LoginJob(user_key, chat_id, self.settings.public_base_url)
                 # This prototype deliberately uses exactly one shared DoorDash account.
                 self.jobs[DEMO_USER_ID] = job
@@ -217,5 +299,8 @@ class ConnectionService:
             self.closed = True
             for job in self.jobs.values():
                 job.cancelled.set()
+            if self.search_job:
+                self.search_job.cancel()
         self.message_pool.shutdown(wait=True, cancel_futures=True)
         self.browser_pool.shutdown(wait=True, cancel_futures=True)
+        self.search_pool.shutdown(wait=True, cancel_futures=True)

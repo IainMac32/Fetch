@@ -74,7 +74,7 @@ class LinqClient:
         response = requests.post(
             f"{self.base_url}/chats/{quote(chat_id, safe='')}/messages",
             headers={"Authorization": f"Bearer {self.api_key}"},
-            json={"parts": [{"type": "text", "value": text}]},
+            json={"message": {"parts": [{"type": "text", "value": text}]}},
             timeout=(5, 15),
         )
         response.raise_for_status()

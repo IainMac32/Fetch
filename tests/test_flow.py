@@ -195,7 +195,7 @@ def test_linq_replies_to_originating_chat(monkeypatch):
     monkeypatch.setattr("shopper.linq.requests.post", post)
     LinqClient("test", "https://api.example/v3").send("chat-a", "Connect here")
     assert post.call_args.args[0] == "https://api.example/v3/chats/chat-a/messages"
-    assert post.call_args.kwargs["json"] == {"parts": [{"type": "text", "value": "Connect here"}]}
+    assert post.call_args.kwargs["json"] == {"message": {"parts": [{"type": "text", "value": "Connect here"}]}}
     assert "timeout" in post.call_args.kwargs
 
 

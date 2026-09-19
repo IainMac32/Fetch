@@ -21,11 +21,13 @@ class Settings:
     model_api_key: str = ""
     stagehand_model: str = ""
     demo_user_handle: str = ""
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4.1-mini"
 
     @classmethod
     def from_env(cls, *, messaging=True):
         load_dotenv()
-        required = ["BROWSERBASE_API_KEY", "DOORDASH_CREDENTIAL_KEY"]
+        required = ["BROWSERBASE_API_KEY"]
         if messaging:
             required += ["LINQ_API_KEY", "LINQ_WEBHOOK_SECRET", "PUBLIC_BASE_URL", "DEMO_USER_HANDLE"]
         missing = [name for name in required if not os.getenv(name)]
@@ -46,6 +48,8 @@ class Settings:
             model_api_key=os.getenv("MODEL_API_KEY", ""),
             stagehand_model=os.getenv("STAGEHAND_MODEL", ""),
             demo_user_handle=os.getenv("DEMO_USER_HANDLE", ""),
+            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
+            openai_model=os.getenv("OPENAI_MODEL", "").strip() or cls.openai_model,
         )
         if messaging:
             url = urlsplit(settings.public_base_url)
