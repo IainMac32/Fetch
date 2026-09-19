@@ -14,7 +14,15 @@ import requests
 
 LOG = logging.getLogger(__name__)
 DEMO_SEARCH_QUERY = "unsweetened oat milk 1L buy online Canada"
-RESULT_LIMIT = 10
+SEARCH_RESULT_LIMIT = 25
+FETCH_LIMIT = 10
+SUPPORTED_PLATFORMS = {
+    "DoorDash": ("doordash.com",),
+    "Uber Eats": ("ubereats.com",),
+    "SkipTheDishes": ("skipthedishes.com",),
+    "Instacart": ("instacart.ca", "instacart.com"),
+    "Walmart": ("walmart.ca", "walmart.com"),
+}
 PAGE_CHAR_LIMIT = 8_000
 MAX_CHOICES = 3
 
@@ -61,6 +69,25 @@ def public_url(value):
         return urlunsplit((url.scheme, url.netloc.lower(), url.path or "/", url.query, ""))
     except ValueError:
         return None
+
+
+def supported_url(value):
+    url = public_url(value)
+    if not url:
+        return None
+    host = urlsplit(url).hostname.lower().rstrip(".")
+    if any(host == domain or host.endswith("." + domain)
+           for domains in SUPPORTED_PLATFORMS.values() for domain in domains):
+        return url
+    return None
+
+
+def targeted_query(query):
+    # Site operators are search hints; supported_url enforces the actual allowlist.
+    sites = " OR ".join("site:" + domains[0] for domains in SUPPORTED_PLATFORMS.values())
+    suffix = " (" + sites + ")"
+    # Only shorten the discovery query; extraction/ranking keep the full request.
+    return query[:200 - len(suffix)].rstrip() + suffix
 
 
 def post_json(url, *, headers, payload, provider, timeout=30):
@@ -116,9 +143,12 @@ class SearchReport:
     choices: list[ProductOffer]
 
     def as_text(self):
-        lines = [f"Search: {self.query}", f"Read {self.fetched} of {self.found} web results."]
+        lines = [f"Search: {self.query}", f"Read {self.fetched} of {self.found} results from supported stores."]
         if not self.choices:
-            lines.append("I couldn't find a clear match in those pages. Try again later.")
+            if not self.found:
+                lines.append("No matching results found on DoorDash, Uber Eats, SkipTheDishes, Instacart or Walmart.")
+            else:
+                lines.append("I couldn't find a clear match in those pages. Try again later.")
         else:
             lines.append("Best matches from the pages I could read:")
             for index, offer in enumerate(self.choices, 1):
@@ -244,24 +274,29 @@ class BrowserbaseWeb:
 
     def search(self, query):
         data = post_json("https://api.browserbase.com/v1/search", headers=self.headers,
-                         payload={"query": query, "numResults": RESULT_LIMIT}, provider="Browserbase Search")
+                         payload={"query": query, "numResults": SEARCH_RESULT_LIMIT}, provider="Browserbase Search")
         if not isinstance(data.get("results"), list):
             raise SearchError("Browserbase Search returned an unexpected response.")
         sources, seen = [], set()
-        for item in data["results"][:RESULT_LIMIT]:
+        for item in data["results"][:SEARCH_RESULT_LIMIT]:
             if not isinstance(item, dict):
                 continue
-            url = public_url(item.get("url"))
+            url = supported_url(item.get("url"))
             title = item.get("title")
             if not url or url in seen or not isinstance(title, str) or not title.strip():
                 continue
             seen.add(url)
             sources.append(Source(str(len(sources) + 1), " ".join(title.split())[:120], url))
+        LOG.info("Search checked %d candidates; kept %d unique supported-store results",
+                 min(len(data["results"]), SEARCH_RESULT_LIMIT), len(sources))
         return sources
 
     def fetch(self, source):
+        if not supported_url(source.url):
+            raise SearchError("This result is not from a supported store.")
         data = post_json("https://api.browserbase.com/v1/fetch", headers=self.headers,
-                         payload={"url": source.url, "format": "markdown", "allowRedirects": True},
+                         # Automatic redirects could fetch content outside the allowlist.
+                         payload={"url": source.url, "format": "markdown", "allowRedirects": False},
                          provider="Browserbase Fetch")
         status, content = data.get("statusCode"), data.get("content")
         if (type(status) is not int or not 200 <= status < 300
@@ -563,9 +598,25 @@ class GrocerySearch:
         progress("Searching the web…")
         sources = self.web.search(query)
         check_cancelled(cancelled)
+        if len(sources) < FETCH_LIMIT:
+            progress("Looking for more results from supported stores…")
+            try:
+                additional = self.web.search(targeted_query(query))
+            except SearchError:
+                if not sources:
+                    raise
+                LOG.warning("Second search unavailable; continuing with the first search's results")
+                additional = []
+            check_cancelled(cancelled)
+            seen = {source.url for source in sources}
+            for source in additional:
+                if source.url not in seen:
+                    sources.append(replace(source, id=str(len(sources) + 1)))
+                    seen.add(source.url)
         if not sources:
             return SearchReport(query, 0, 0, [])
-        progress(f"Reading {len(sources)} search results…")
+        selected = sources[:FETCH_LIMIT]
+        progress(f"Reading {len(selected)} results from supported stores…")
 
         def fetch(source):
             check_cancelled(cancelled)
@@ -576,7 +627,7 @@ class GrocerySearch:
                 return None
 
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="web-fetch") as pool:
-            fetched = [source for source in pool.map(fetch, sources) if source is not None]
+            fetched = [source for source in pool.map(fetch, selected) if source is not None]
         check_cancelled(cancelled)
         if not fetched:
             raise SearchError("I found web results but couldn't read their pages. Text SEARCH to try again.")
