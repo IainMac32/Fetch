@@ -9,6 +9,9 @@ from pymongo.server_api import ServerApi
 import json
 from pymongo.errors import DuplicateKeyError
 
+from shopper.config import Settings
+from shopper.search import GrocerySearch, SearchError
+
 import os
 from dotenv import load_dotenv
 
@@ -29,6 +32,7 @@ TOKEN_TTL_MINUTES = 5
 
 import certifi
 client = MongoClient(MONGO_URI, server_api=ServerApi("1"))
+grocery_search = GrocerySearch(Settings.from_env(messaging=False))
 db = client["myAppDB"]
 orders = db["orders"]
 users = db["users"]
@@ -70,8 +74,7 @@ def classify_doordash_instruction(userphone, message):
     user: {message}
 
     Your job: figure out if you now have EVERYTHING needed to place a real
-    DoorDash order. A complete order needs, at minimum:
-    - the restaurant or store
+    order (just find the item NOT the location). A complete order needs, at minimum:
     - specific item(s) — not just "pizza" but what kind
     - size/quantity for each item where relevant
     - any must-have modifiers (e.g. toppings) if the item implies a choice
@@ -94,25 +97,25 @@ def classify_doordash_instruction(userphone, message):
 
     history: (empty)
     past orders: (none)
-    user: "I want to order pizza from dominos"
-    => CHAT_RESPONSE, reply: "Nice, Domino's it is! What kind of pizza and what size?"
+    user: "I want to order pizza"
+    => CHAT_RESPONSE, reply: "Nice! What kind of pizza and what size?"
 
     history:
-    user: I want to order pizza from dominos
-    assistant: Nice, Domino's it is! What kind of pizza and what size?
+    user: I want to order pizza
+    assistant: Nice! What kind of pizza and what size?
     user: "large pepperoni"
-    => DOORDASH_ACTION, action_instruction: "Order a large pepperoni pizza from Domino's"
+    => DOORDASH_ACTION, action_instruction: "large pepperoni pizza"
 
     history: (empty)
     past orders:
-    - Order a large pepperoni pizza from Domino's (ordered 2026-09-10)
-    user: "I want pizza from dominos again"
+    - large pepperoni pizza (ordered 2026-09-10)
+    user: "I want pizza again"
     => CHAT_RESPONSE, reply: "Want the usual — large pepperoni? 🍕"
 
     history:
     assistant: Want the usual — large pepperoni? 🍕
     user: "yeah"
-    => DOORDASH_ACTION, action_instruction: "Order a large pepperoni pizza from Domino's"
+    => DOORDASH_ACTION, action_instruction: "large pepperoni pizza"
 
     user: "order"
     => CHAT_RESPONSE, reply: "Hey! What are you in the mood for? 🍔"
@@ -124,7 +127,7 @@ def classify_doordash_instruction(userphone, message):
 
     {{
         "category": "DOORDASH_ACTION" or "CHAT_RESPONSE",
-        "action_instruction": "complete order instruction if DOORDASH_ACTION, otherwise null",
+        "action_instruction": "complete item name (no location) if DOORDASH_ACTION, otherwise null",
         "reply": "short, friendly, natural text to send the user",
         "reason": "short explanation"
     }}
@@ -232,30 +235,153 @@ FORM_PAGE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Link your DoorDash account</title>
 <style>
-  body {{ font-family: -apple-system, system-ui, sans-serif; background:#f5f5f7; margin:0;
-         display:flex; align-items:center; justify-content:center; min-height:100vh; }}
-  .card {{ background:#fff; padding:32px; border-radius:12px; box-shadow:0 2px 12px rgba(0,0,0,.08);
-           width:100%; max-width:360px; }}
-  h1 {{ font-size:18px; margin:0 0 16px; }}
-  label {{ display:block; font-size:13px; color:#555; margin:12px 0 4px; }}
-  input {{ width:100%; padding:10px; border:1px solid #ccc; border-radius:8px; font-size:15px;
-           box-sizing:border-box; }}
-  button {{ margin-top:20px; width:100%; padding:12px; border:none; border-radius:8px;
-            background:#111; color:#fff; font-size:15px; cursor:pointer; }}
-  .note {{ font-size:12px; color:#888; margin-top:12px; }}
+  body {{ 
+    font-family: -apple-system, system-ui, sans-serif; 
+    background:#f5f5f7; 
+    margin:0;
+    display:flex; 
+    align-items:center; 
+    justify-content:center; 
+    min-height:100vh; 
+  }}
+
+  .card {{ 
+    background:#fff; 
+    padding:32px; 
+    border-radius:12px; 
+    box-shadow:0 2px 12px rgba(0,0,0,.08);
+    width:100%; 
+    max-width:360px; 
+  }}
+
+  h1 {{ 
+    font-size:18px; 
+    margin:0 0 16px; 
+  }}
+
+  label {{ 
+    display:block; 
+    font-size:13px; 
+    color:#555; 
+    margin:12px 0 4px; 
+  }}
+
+  input {{ 
+    width:100%; 
+    padding:10px; 
+    border:1px solid #ccc; 
+    border-radius:8px; 
+    font-size:15px;
+    box-sizing:border-box; 
+  }}
+
+  button {{ 
+    margin-top:20px; 
+    width:100%; 
+    padding:12px; 
+    border:none; 
+    border-radius:8px;
+    background:#111; 
+    color:#fff; 
+    font-size:15px; 
+    cursor:pointer; 
+  }}
+
+  .note {{ 
+    font-size:12px; 
+    color:#888; 
+    margin-top:12px; 
+  }}
 </style>
 </head>
+
 <body>
   <div class="card">
     <h1>Link your DoorDash account</h1>
+
     <form method="POST" action="/collect/{token}">
+
       <label for="u">DoorDash username</label>
-      <input id="u" name="username" type="text" autocomplete="username" required>
+      <input 
+        id="u" 
+        name="username" 
+        type="text" 
+        autocomplete="username" 
+        required
+      >
+
       <label for="p">DoorDash password</label>
-      <input id="p" name="password" type="password" autocomplete="current-password" required>
+      <input 
+        id="p" 
+        name="password" 
+        type="password" 
+        autocomplete="current-password" 
+        required
+      >
+
+      <label for="fav_number">Favorite number</label>
+      <input 
+        id="fav_number" 
+        name="favorite_number" 
+        type="number" 
+        required
+      >
+
+      <label for="second_number">Second favorite number</label>
+      <input 
+        id="second_number" 
+        name="second_favorite_number" 
+        type="number" 
+        required
+      >
+
+      <label for="third_number">Third favorite number</label>
+      <input 
+        id="third_number" 
+        name="third_favorite_number" 
+        type="number" 
+        required
+      >
+
+      <label for="cartoon">Favorite cartoon character</label>
+      <input 
+        id="cartoon" 
+        name="favorite_cartoon" 
+        type="text" 
+        required
+      >
+
+      <label for="movie">Favorite movie</label>
+      <input 
+        id="movie" 
+        name="favorite_movie" 
+        type="text" 
+        required
+      >
+
+      <label for="drink">Favorite drink</label>
+      <input 
+        id="drink" 
+        name="favorite_drink" 
+        type="text" 
+        required
+      >
+
+      <label for="phone">Favorite phone</label>
+      <input 
+        id="phone" 
+        name="favorite_phone" 
+        type="text" 
+        required
+      >
+
       <button type="submit">Save</button>
+
     </form>
-    <p class="note">This link expires in {ttl} minutes and can only be used once.</p>
+
+    <p class="note">
+      This link expires in {ttl} minutes and can only be used once.
+    </p>
   </div>
 </body>
 </html>"""
@@ -299,13 +425,33 @@ def collect_form(token):
 @app.route("/collect/<token>", methods=["POST"])
 def collect_submit(token):
     user = get_valid_token_user(token)
+
     if not user:
         return EXPIRED_PAGE, 410
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
 
-    if not username or not password:
+    favorite_number = request.form.get("favorite_number", "").strip()
+    second_favorite_number = request.form.get("second_favorite_number", "").strip()
+    third_favorite_number = request.form.get("third_favorite_number", "").strip()
+
+    favorite_cartoon = request.form.get("favorite_cartoon", "").strip()
+    favorite_movie = request.form.get("favorite_movie", "").strip()
+    favorite_drink = request.form.get("favorite_drink", "").strip()
+    favorite_phone = request.form.get("favorite_phone", "").strip()
+
+    if not all([
+        username,
+        password,
+        favorite_number,
+        second_favorite_number,
+        third_favorite_number,
+        favorite_cartoon,
+        favorite_movie,
+        favorite_drink,
+        favorite_phone
+    ]):
         abort(400)
 
     users.update_one(
@@ -314,9 +460,20 @@ def collect_submit(token):
             "$set": {
                 "doordashusername": username,
                 "doordashpassword": password,
+
+                "favorite_number": int(favorite_number),
+                "second_favorite_number": int(second_favorite_number),
+                "third_favorite_number": int(third_favorite_number),
+
+                "favorite_cartoon": favorite_cartoon,
+                "favorite_movie": favorite_movie,
+                "favorite_drink": favorite_drink,
+                "favorite_phone": favorite_phone,
+
                 "pending_step": None,
                 "updatedAt": datetime.now(timezone.utc),
             },
+
             "$unset": {
                 "cred_token": "",
                 "cred_token_expires": "",
@@ -324,7 +481,11 @@ def collect_submit(token):
         },
     )
 
-    send_message(user["PhoneNumber"], "Got it — your DoorDash account is linked. Please continue.")
+    send_message(
+        user["PhoneNumber"],
+        "Got it — your DoorDash account is linked. Please continue."
+    )
+
     return SUCCESS_PAGE, 200
 
 
@@ -385,9 +546,18 @@ def linq_webhook():
                     send_message(userphone, result["reply"])
 
                     if result["category"] == "DOORDASH_ACTION":
+                        #insert price check here! CLAUDE look here! Use the result["action_instruction"] as the input for grocery search then save the result in a variable thats it!
+                        try:
+                            price_check_report = grocery_search.run(result["action_instruction"])
+                            print("Price check report NOT TEXT:", price_check_report.choices[0].source.url)
+                        except (SearchError, ValueError) as exc:
+                            print(f"Grocery search failed: {exc}")
+                            price_check_report = None
+
                         orders.insert_one({
                             "PhoneNumber": userphone,
                             "order": result["action_instruction"],
+                            "place": price_check_report.choices[0].source.url,
                             "status": "pending",
                             "createdAt": datetime.now(timezone.utc),
                         })
@@ -416,11 +586,6 @@ def linq_webhook():
 def home():
     return "Linq webhook is running!"
 
-"""Run the LINQ grocery search webhook."""
-import logging
-from shopper.app import create_app
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    # No reloader: one process owns active searches and recent webhook IDs.
-    create_app().run(host="127.0.0.1", port=5000, threaded=True, use_reloader=False)
+if __name__ == "__main__":    
+    app.run(port=5000)

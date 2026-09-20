@@ -1,16 +1,39 @@
-"""Explicit manual messaging utility. Importing this module never sends a text."""
-import argparse
+import logging
 import os
 
-from dotenv import load_dotenv
-from shopper.linq import LinqClient
+# Change "product_search" to your module's filename, without .py
+# (the file that contains DEMO_SEARCH_QUERY and post_json)
+from product_search import post_json, targeted_query
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Send a message to an existing LINQ chat")
-    parser.add_argument("chat_id")
-    parser.add_argument("message")
-    args = parser.parse_args()
-    load_dotenv()
-    client = LinqClient(os.environ["LINQ_API_KEY"], os.getenv("LINQ_BASE_URL", "https://api.linqapp.com/api/partner/v3"))
-    client.send(args.chat_id, args.message)
-    print("Message accepted by LINQ.")
+logging.basicConfig(level=logging.INFO)
+
+# If your keys live in a .env file, uncomment these two lines:
+# from dotenv import load_dotenv
+# load_dotenv()
+
+headers = {"X-BB-API-Key": os.environ["BROWSERBASE_API_KEY"]}
+q = "2 cucumbers buy online Canada"
+
+# 1. Raw search results, before the allowlist filter
+doordash_urls = []
+for query in (q, targeted_query(q)):
+    raw = post_json("https://api.browserbase.com/v1/search", headers=headers,
+                    payload={"query": query, "numResults": 25}, provider="BB")
+    print("\nQUERY:", query)
+    for r in raw["results"]:
+        url = r.get("url") or ""
+        print("  ", url)
+        if "doordash.com" in url:
+            doordash_urls.append(url)
+
+# 2. Fetch the first DoorDash URL and look at what actually comes back
+if not doordash_urls:
+    print("\nNo doordash.com URLs in either search. The search step is the problem.")
+else:
+    url = doordash_urls[0]
+    print("\nFETCHING:", url)
+    data = post_json("https://api.browserbase.com/v1/fetch", headers=headers,
+                     payload={"url": url, "format": "markdown", "allowRedirects": False},
+                     provider="BB")
+    print("STATUS:", data.get("statusCode"))
+    print((data.get("content") or "")[:1500])

@@ -26,12 +26,22 @@ DEMO_SEARCH_QUERY = "2 cucumbers buy online Canada"
 SEARCH_RESULT_LIMIT = 25
 FETCH_LIMIT = 10
 SUPPORTED_PLATFORMS = {
+
     "DoorDash": ("doordash.com",),
-    "Uber Eats": ("ubereats.com",),
-    "SkipTheDishes": ("skipthedishes.com",),
-    "Instacart": ("instacart.ca", "instacart.com"),
-    "Walmart": ("walmart.ca", "walmart.com"),
 }
+
+
+    
+    #    "SkipTheDishes": ("skipthedishes.com",),
+    #"Uber Eats": ("ubereats.com",),
+    #"Walmart": ("walmart.ca", "walmart.com"),
+    #"Instacart": ("instacart.ca", "instacart.com"),
+    #    
+   #
+   #    
+
+
+
 PAGE_CHAR_LIMIT = 8_000
 MAX_CHOICES = 3
 MAX_ATTRIBUTES = 4
@@ -601,8 +611,10 @@ class ProductStandardizer:
             coverage = Decimal(len(matched)) / Decimal(len(terms)) if terms else Decimal(1)
             # The head term is the item itself, so it must be in the product's own name.
             if head and not term_pattern(head).search(offer.name_quote):
+                LOG.info("Dropped source %s: head %r not in name %r", offer.source.id, head, offer.name_quote)
                 continue
             if coverage < MIN_TERM_COVERAGE:
+                LOG.info("Dropped source %s: coverage %s", offer.source.id, coverage)
                 continue
             unit_price, label = unit_price_for(offer.price_amount, offer.size)
             eligible.append(replace(offer, matched_terms=matched, coverage=coverage,
