@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import lru_cache
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
@@ -25,23 +25,19 @@ DEMO_SEARCH_QUERY = "2 cucumbers buy online Canada"
 
 SEARCH_RESULT_LIMIT = 25
 FETCH_LIMIT = 10
+PLATFORM_FETCH_LIMIT = 2
+MAX_FETCH_REDIRECTS = 2
+# Item searches run concurrently; share this cap across their fetch pools.
+# Browserbase limits concurrent fetch requests per account.
+MAX_CONCURRENT_FETCHES = 2
+_FETCH_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_FETCHES)
 SUPPORTED_PLATFORMS = {
-
     "DoorDash": ("doordash.com",),
+    "Uber Eats": ("ubereats.com",),
+    "SkipTheDishes": ("skipthedishes.com",),
+    "Instacart": ("instacart.ca", "instacart.com"),
+    "Walmart": ("walmart.ca", "walmart.com"),
 }
-
-
-    
-    #    "SkipTheDishes": ("skipthedishes.com",),
-    #"Uber Eats": ("ubereats.com",),
-    #"Walmart": ("walmart.ca", "walmart.com"),
-    #"Instacart": ("instacart.ca", "instacart.com"),
-    #    
-   #
-   #    
-
-
-
 PAGE_CHAR_LIMIT = 8_000
 MAX_CHOICES = 3
 MAX_ATTRIBUTES = 4
@@ -129,12 +125,39 @@ def supported_url(value):
     return None
 
 
-def targeted_query(query):
+def marketplace_for_url(url):
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return next((name for name, domains in SUPPORTED_PLATFORMS.items()
+                 if any(host == domain or host.endswith("." + domain) for domain in domains)), None)
+
+
+def normalize_location(location):
+    if location is None:
+        return None
+    if (not isinstance(location, str) or not 1 <= len(location.strip()) <= 80
+            or any(not (char.isalnum() or char in " ,.'’-\t") for char in location)):
+        raise SearchError("Use a city, province and postal code (up to 80 characters), e.g. Toronto, ON M5V 2T6.")
+    return " ".join(location.split())
+
+
+def discovery_query(query, location=None, suffix=""):
+    location = normalize_location(location)
+    context = (" " + location if location else "") + suffix
+    # Preserve location and site constraints when shortening long item queries.
+    return query[:200 - len(context)].rstrip() + context
+
+
+def targeted_query(query, location=None):
     # Site operators are search hints; supported_url enforces the actual allowlist.
     sites = " OR ".join("site:" + domains[0] for domains in SUPPORTED_PLATFORMS.values())
     suffix = " (" + sites + ")"
     # Only shorten the discovery query; extraction/ranking keep the full request.
-    return query[:200 - len(suffix)].rstrip() + suffix
+    return discovery_query(query, location, suffix)
+
+
+def targeted_platform_query(query, domain, location=None):
+    suffix = " site:" + domain
+    return discovery_query(query, location, suffix)
 
 
 def post_json(url, *, headers, payload, provider, timeout=30):
@@ -175,6 +198,7 @@ class ProductOffer:
     source: Source
     name_quote: str
     attribute_quotes: tuple[str, ...]
+    merchant_quote: str | None
     size_quote: str | None
     size: Measure | None
     price_quote: str | None
@@ -196,9 +220,39 @@ class SearchReport:
     found: int
     fetched: int
     choices: list[ProductOffer]
+    candidates: list[ProductOffer] | None = None
+    location: str | None = None
 
-    def as_text(self):
+    @property
+    def basket_choices(self):
+        return self.candidates if self.candidates is not None else self.choices
+
+    def recommendation_lines(self):
+        if not self.choices:
+            return ["No recommended site yet: no verified product matches. Try a more specific item."]
+        offer = self.choices[0]
+        site = marketplace_for_url(offer.source.url) or "retailer"
+        lines = [f"Recommended site: {site}", offer.name_quote]
+        if offer.price_amount is not None:
+            lines.append(f"Listed price: {format_money(offer.price_amount)} "
+                         f"{offer.currency or '(currency unconfirmed)'}")
+        else:
+            lines.append("Check the product page for its current price.")
+        lines.extend([offer.source.url, "Best ranked product match from the pages read."])
+        return lines
+
+    def as_text(self, *, detailed=True):
+        recommendation = self.recommendation_lines()
+        if not detailed:
+            if self.location:
+                recommendation.append(f"Search location: {self.location}")
+            recommendation.append("Confirm local price, stock and delivery fees on the site.")
+            return "\n".join(recommendation)
         lines = [f"Search: {self.query}", f"Read {self.fetched} of {self.found} results from supported stores."]
+        lines.extend(recommendation)
+        if self.location:
+            lines.extend([f"Search location: {self.location}",
+                          "Delivery availability and local prices unverified."])
         if not self.choices:
             if not self.found:
                 lines.append(f"No matching results found on {PLATFORM_LIST}.")
@@ -209,7 +263,7 @@ class SearchReport:
             for index, offer in enumerate(self.choices, 1):
                 described = [offer.name_quote, *offer.attribute_quotes,
                              format_measure(offer.size) if offer.size else "size not confirmed"]
-                lines.extend(["", f"{index}. {offer.source.title}",
+                lines.extend(["", f"{index}. {offer.source.title or offer.name_quote}",
                               "Standardized item: " + " · ".join(described)])
                 if offer.price_amount is not None:
                     listed = f"{format_money(offer.price_amount)} {offer.currency or '(currency unclear)'}"
@@ -349,7 +403,8 @@ def parse_price(quote):
 
 def availability_from_quote(quote):
     text = (quote or "").casefold()
-    if re.search(r"\b(out of stock|sold out|unavailable|currently unavailable|backordered)\b", text):
+    if re.search(r"\b(out of stock|sold out|unavailable|currently unavailable|backordered|"
+                 r"not (?:currently )?(?:available|in stock))\b", text):
         return "out_of_stock"
     if re.search(r"\b(in stock|available (?:now|online|for delivery|for pickup)|ready to ship|add to (?:cart|bag|order))\b", text):
         return "in_stock"
@@ -371,7 +426,7 @@ class BrowserbaseWeb:
     def __init__(self, api_key):
         self.headers = {"X-BB-API-Key": api_key}
 
-    def search(self, query):
+    def search(self, query, *, domains=None):
         data = post_json("https://api.browserbase.com/v1/search", headers=self.headers,
                          payload={"query": query, "numResults": SEARCH_RESULT_LIMIT}, provider="Browserbase Search")
         if not isinstance(data.get("results"), list):
@@ -381,6 +436,10 @@ class BrowserbaseWeb:
             if not isinstance(item, dict):
                 continue
             url = supported_url(item.get("url"))
+            if domains and (not url or not any(
+                    urlsplit(url).hostname == domain or urlsplit(url).hostname.endswith("." + domain)
+                    for domain in domains)):
+                continue
             title = item.get("title")
             if not url or url in seen or not isinstance(title, str) or not title.strip():
                 continue
@@ -393,15 +452,39 @@ class BrowserbaseWeb:
     def fetch(self, source):
         if not supported_url(source.url):
             raise SearchError("This result is not from a supported store.")
-        data = post_json("https://api.browserbase.com/v1/fetch", headers=self.headers,
-                         # Automatic redirects could fetch content outside the allowlist.
-                         payload={"url": source.url, "format": "markdown", "allowRedirects": False},
-                         provider="Browserbase Fetch")
+        url, visited = source.url, {source.url}
+        for hop in range(MAX_FETCH_REDIRECTS + 1):
+            data = post_json("https://api.browserbase.com/v1/fetch", headers=self.headers,
+                             # Check each redirect ourselves before making the next request.
+                             payload={"url": url, "format": "markdown", "allowRedirects": False},
+                             provider="Browserbase Fetch")
+            status = data.get("statusCode")
+            if type(status) is not int or status not in {301, 302, 303, 307, 308}:
+                break
+            headers = data.get("headers")
+            location = next((value for key, value in headers.items()
+                             if isinstance(key, str) and key.casefold() == "location"), None) \
+                if isinstance(headers, dict) else None
+            try:
+                target = (supported_url(urljoin(url, location))
+                          if isinstance(location, str) and location.strip() else None)
+            except ValueError:
+                target = None
+            if not target or target in visited or hop == MAX_FETCH_REDIRECTS:
+                LOG.info("Skipping unsafe, repeated or excessive redirect: source=%s", source.id)
+                raise SearchError("This page redirected to an unsupported location or too many times.")
+            LOG.info("Following supported-store redirect: source=%s hop=%s", source.id, hop + 1)
+            visited.add(target)
+            url = target
         status, content = data.get("statusCode"), data.get("content")
         if (type(status) is not int or not 200 <= status < 300
                 or not isinstance(content, str) or not content.strip()):
+            LOG.info("Unreadable retailer page: source=%s status=%s", source.id,
+                     status if type(status) is int else "missing")
             raise SearchError("This page couldn't be read.")
-        return replace(source, content=content.strip()[:PAGE_CHAR_LIMIT])
+        # Search titles describe the original URL; use final-page evidence after redirects.
+        return replace(source, url=url, title=source.title if url == source.url else "",
+                       content=content.strip()[:PAGE_CHAR_LIMIT])
 
 
 class ProductStandardizer:
@@ -416,12 +499,13 @@ class ProductStandardizer:
                 "type": "array", "maxItems": len(sources), "items": {
                     "type": "object", "additionalProperties": False,
                     "required": ["source_id", "name_quote", "attribute_quotes",
-                                 "size_quote", "price_quote", "availability_quote"],
+                                 "merchant_quote", "size_quote", "price_quote", "availability_quote"],
                     "properties": {
                         "source_id": {"type": "string", "enum": [s.id for s in sources]},
                         "name_quote": {"type": ["string", "null"], "maxLength": 180},
                         "attribute_quotes": {"type": "array", "maxItems": MAX_ATTRIBUTES,
                                              "items": {"type": "string", "maxLength": 80}},
+                        "merchant_quote": {"type": ["string", "null"], "maxLength": 100},
                         "size_quote": {"type": ["string", "null"], "maxLength": 100},
                         "price_quote": {"type": ["string", "null"], "maxLength": 100},
                         "availability_quote": {"type": ["string", "null"], "maxLength": 120},
@@ -440,12 +524,16 @@ class ProductStandardizer:
             "name_quote is the listed product's own name as it appears on the page, including brand and "
             "descriptors when they fall inside the same contiguous excerpt; use null when no excerpt "
             "names a single purchasable product. "
+            "merchant_quote identifies the specific retailer or shop selling this item, not the marketplace "
+            "platform. Copy a contiguous excerpt from the page that names the shop, or use null when its "
+            "identity is not clear. Never infer the shop from the product brand. "
             f"attribute_quotes holds up to {MAX_ATTRIBUTES} short verbatim excerpts stating the product's "
             "own attributes, such as flavour, variety, material, colour, model, capacity or certification. "
             "Use an empty array when the page states none; never put price or availability wording here. "
             "size_quote must quote the package's stated volume, weight or item count (include multipack "
             "quantities when shown), not a serving size or a shipping weight. "
-            "price_quote must quote the listed product's price, not a delivery fee or another item's price. "
+            "price_quote must quote the listed product's price, including its adjacent currency code or "
+            "symbol when shown, not a delivery fee or another item's price. "
             "availability_quote must quote explicit stock or add-to-cart wording, or be null. "
             "Never calculate, infer, or invent names, attributes, sizes, currency, prices, or availability. "
             "Use null quotes when the page lacks evidence. For reviews, category listings, login walls and "
@@ -511,7 +599,7 @@ class ProductStandardizer:
         if not isinstance(items, list) or len(items) > len(sources):
             raise ExtractionValidationError("invalid_offer_count")
         by_id, seen, offers = {s.id: s for s in sources}, set(), []
-        fields = {"source_id", "name_quote", "attribute_quotes", "size_quote",
+        fields = {"source_id", "name_quote", "attribute_quotes", "merchant_quote", "size_quote",
                   "price_quote", "availability_quote"}
         for position, item in enumerate(items, 1):
             if not isinstance(item, dict) or set(item) != fields:
@@ -543,6 +631,16 @@ class ProductStandardizer:
                 raise ExtractionValidationError("quote_not_in_source", offer=position, field=key)
             return quote
 
+        def optional_quote(key, limit):
+            # A missing price or stock signal must not invalidate a verified product.
+            # Discard bad evidence rather than passing it to ranking or the reply.
+            try:
+                return verified(item[key], key, limit)
+            except ExtractionValidationError as exc:
+                LOG.warning("Ignoring unverified field: reason=%s offer=%s field=%s",
+                            exc.reason, position, key)
+                return None
+
         name_quote = verified(item["name_quote"], "name_quote", 180)
         if not name_quote:
             raise ExtractionValidationError("no_product_named", offer=position, field="name_quote")
@@ -557,16 +655,20 @@ class ProductStandardizer:
                 seen_attributes.add(quote.casefold())
                 attributes.append(quote)
 
+        merchant_quote = optional_quote("merchant_quote", 100)
         size_quote = verified(item["size_quote"], "size_quote", 100)
-        price_quote = verified(item["price_quote"], "price_quote", 100)
-        availability_quote = verified(item["availability_quote"], "availability_quote", 120)
+        price_quote = optional_quote("price_quote", 100)
+        availability_quote = optional_quote("availability_quote", 120)
 
         price_amount, currency = parse_price(price_quote)
         availability = availability_from_quote(availability_quote)
         if availability_quote and availability == "unknown":
-            raise ExtractionValidationError("availability_not_recognized", offer=position, field="availability_quote")
+            LOG.warning("Ignoring unrecognized field: reason=availability_not_recognized offer=%s "
+                        "field=availability_quote", position)
+            availability_quote = None
         return ProductOffer(
             source=source, name_quote=name_quote, attribute_quotes=tuple(attributes),
+            merchant_quote=merchant_quote,
             size_quote=size_quote, size=parse_measure(size_quote),
             price_quote=price_quote, price_amount=price_amount, currency=currency,
             availability=availability, availability_quote=availability_quote,
@@ -682,7 +784,7 @@ class ProductStandardizer:
         scored.sort(key=lambda offer: (-offer.score,
                                        offer.unit_price if offer.unit_price is not None else Decimal("Infinity"),
                                        offer.source.title.casefold(), offer.source.id))
-        return scored[:MAX_CHOICES]
+        return scored
 
 
 class ProductSearch:
@@ -695,7 +797,8 @@ class ProductSearch:
         if not self.settings.browserbase_api_key or not self.settings.openai_api_key:
             raise SearchError("Search isn't configured yet. Set BROWSERBASE_API_KEY and OPENAI_API_KEY on the server.")
 
-    def run(self, query=DEMO_SEARCH_QUERY, *, cancelled=None, progress=lambda message: None):
+    def run(self, query=DEMO_SEARCH_QUERY, *, location=None, cancelled=None, progress=lambda message: None):
+        location = normalize_location(location)
         self.check_config()
         if not isinstance(query, str) or not 1 <= len(query.strip()) <= 200:
             raise SearchError("Use a search query between 1 and 200 characters.")
@@ -703,12 +806,12 @@ class ProductSearch:
         cancelled = cancelled if cancelled is not None else threading.Event()
         check_cancelled(cancelled)
         progress("Searching the web…")
-        sources = self.web.search(query)
+        sources = self.web.search(discovery_query(query, location))
         check_cancelled(cancelled)
         if len(sources) < FETCH_LIMIT:
             progress("Looking for more results from supported stores…")
             try:
-                additional = self.web.search(targeted_query(query))
+                additional = self.web.search(targeted_query(query, location))
             except SearchError:
                 if not sources:
                     raise
@@ -721,17 +824,55 @@ class ProductSearch:
                     sources.append(replace(source, id=str(len(sources) + 1)))
                     seen.add(source.url)
         if not sources:
-            return SearchReport(query, 0, 0, [])
+            return SearchReport(query, 0, 0, [], location=location)
+        return replace(self._read_and_rank(query, sources, cancelled=cancelled, progress=progress),
+                       location=location)
+
+    def run_all_stores(self, query, *, location=None, cancelled=None, progress=lambda message: None):
+        """Search every supported marketplace for this item before ranking offers."""
+        location = normalize_location(location)
+        self.check_config()
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 200:
+            raise SearchError("Use a search query between 1 and 200 characters.")
+        query = query.strip()
+        cancelled = cancelled if cancelled is not None else threading.Event()
+        check_cancelled(cancelled)
+        sources, errors = [], []
+        progress(f"Searching all {len(SUPPORTED_PLATFORMS)} supported stores…")
+        for platform, domains in SUPPORTED_PLATFORMS.items():
+            check_cancelled(cancelled)
+            progress(f"Searching {platform}…")
+            try:
+                found = self.web.search(targeted_platform_query(query, domains[0], location), domains=domains)
+            except SearchError as exc:
+                errors.append(exc)
+                LOG.info("Skipping unavailable marketplace: %s", platform)
+                continue
+            selected = found[:PLATFORM_FETCH_LIMIT]
+            offset = len(sources)
+            sources.extend(replace(source, id=str(offset + index + 1))
+                           for index, source in enumerate(selected))
+        check_cancelled(cancelled)
+        if not sources:
+            if errors:
+                raise errors[0]
+            return SearchReport(query, 0, 0, [], location=location)
+        return replace(self._read_and_rank(query, sources, cancelled=cancelled, progress=progress),
+                       location=location)
+
+    def _read_and_rank(self, query, sources, *, cancelled, progress):
         selected = sources[:FETCH_LIMIT]
         progress(f"Reading {len(selected)} results from supported stores…")
 
         def fetch(source):
-            check_cancelled(cancelled)
-            try:
-                return self.web.fetch(source)
-            except SearchError:
-                LOG.info("Skipping unreadable search result %s", source.id)
-                return None
+            with _FETCH_SLOTS:
+                # A queued fetch may have been cancelled while waiting for a slot.
+                check_cancelled(cancelled)
+                try:
+                    return self.web.fetch(source)
+                except SearchError:
+                    LOG.info("Skipping unreadable search result %s", source.id)
+                    return None
 
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="web-fetch") as pool:
             fetched = [source for source in pool.map(fetch, selected) if source is not None]
@@ -739,9 +880,9 @@ class ProductSearch:
         if not fetched:
             raise SearchError("I found web results but couldn't read their pages. Text SEARCH to try again.")
         progress(f"Comparing {len(fetched)} readable pages…")
-        choices = self.standardizer.standardize_and_rank(query, fetched)
+        candidates = self.standardizer.standardize_and_rank(query, fetched)
         check_cancelled(cancelled)
-        return SearchReport(query, len(sources), len(fetched), choices)
+        return SearchReport(query, len(sources), len(fetched), candidates[:MAX_CHOICES], candidates)
 
 
 # Old name kept so existing callers/imports keep working.

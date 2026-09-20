@@ -7,7 +7,7 @@ import pytest
 
 from shopper.search import (BrowserbaseWeb, GrocerySearch, SearchCancelled, SearchError,
                             Source, supported_url, targeted_query)
-from test_search import CONTENT, SETTINGS, ai_response
+from test_search import CONTENT, SETTINGS, TEST_QUERY, ai_response
 
 
 def result(url):
@@ -68,7 +68,7 @@ def test_second_search_filters_deduplicates_and_caps_total_fetches(discovery):
         [result("https://www.doordash.com/milk#again")]
         + [result(f"https://www.walmart.ca/milk/{i}") for i in range(24)],
     ])
-    report = GrocerySearch(SETTINGS).run()
+    report = GrocerySearch(SETTINGS).run(TEST_QUERY)
     searches = [p for url, p in calls if url.endswith("/search")]
     fetches = [p for url, p in calls if url.endswith("/fetch")]
     extractions = [p for url, p in calls if url.endswith("/responses")]
@@ -89,7 +89,7 @@ def test_second_search_filters_deduplicates_and_caps_total_fetches(discovery):
 def test_second_search_only_when_fewer_than_ten_approved_results(discovery, count, search_count):
     batches, calls = discovery
     batches.extend([[result(f"https://www.walmart.ca/{i}") for i in range(count)], []])
-    GrocerySearch(SETTINGS).run()
+    GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert sum(url.endswith("/search") for url, _ in calls) == search_count
     assert sum(url.endswith("/fetch") for url, _ in calls) == min(count, 10)
 
@@ -99,7 +99,7 @@ def test_no_supported_results_stops_after_two_searches_without_fetch_or_ai(disco
     # A supported URL beyond the requested 25 must not evade the discovery cap.
     batch = [result(f"https://unapproved.example/{i}") for i in range(25)]
     batches.extend([batch + [result("https://www.walmart.ca/milk")], batch])
-    report = GrocerySearch(SETTINGS).run()
+    report = GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert len(calls) == 2 and all(url.endswith("/search") for url, _ in calls)
     assert report.found == report.fetched == 0
     assert "No matching results found on DoorDash" in report.as_text()
@@ -108,7 +108,7 @@ def test_no_supported_results_stops_after_two_searches_without_fetch_or_ai(disco
 def test_failed_second_search_preserves_first_results(discovery):
     batches, calls = discovery
     batches.extend([[result("https://www.walmart.ca/milk")], SearchError("unavailable")])
-    report = GrocerySearch(SETTINGS).run()
+    report = GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert report.found == report.fetched == 1
     assert len(report.choices) == 1
     assert sum(url.endswith("/search") for url, _ in calls) == 2
@@ -118,7 +118,7 @@ def test_failed_second_search_with_no_results_reports_failure(discovery):
     batches, calls = discovery
     batches.extend([[], SearchError("unavailable")])
     with pytest.raises(SearchError, match="unavailable"):
-        GrocerySearch(SETTINGS).run()
+        GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert len(calls) == 2
 
 
