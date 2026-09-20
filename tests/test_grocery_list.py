@@ -63,6 +63,7 @@ def fruit_api(monkeypatch):
         calls.append((url, data))
         if url.endswith("/search"):
             query, _, domain = data["query"].partition(" site:")
+            domain = domain.split()[0]
             fruit = query.split()[-1].lower()
             return {"results": [
                 {"title": f"{fruit.title()} 1 kg", "url": f"https://www.{domain}/{fruit}/{index}"}
@@ -75,6 +76,7 @@ def fruit_api(monkeypatch):
         if url.endswith("/responses"):
             evidence = json.loads(data["input"][1]["content"])
             offers = [{"source_id": source["id"], "name_quote": source["title"],
+                       "match_type": "direct_product",
                        "attribute_quotes": [], "merchant_quote": "Walmart", "size_quote": "1 kg",
                        "price_quote": "CAD$3.00",
                        "availability_quote": "Available online"} for source in evidence["sources"]]

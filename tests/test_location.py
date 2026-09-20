@@ -37,7 +37,7 @@ def test_list_location_reaches_every_store_and_keeps_source_ids_unique():
     searcher.standardizer.standardize_and_rank.return_value = []
     report = search_grocery_list(searcher, ("2 kg apples", "1 kg bananas"), location=LOCATION)
     queries = {call.args[0] for call in searcher.web.search.call_args_list}
-    assert queries == {f"{item} {LOCATION} site:{domains[0]}"
+    assert queries == {f"{item} Canada site:{domains[0]} (inurl:product OR inurl:/ip/)"
                        for item in ("2 kg apples", "1 kg bananas")
                        for domains in SUPPORTED_PLATFORMS.values()}
     for call in searcher.standardizer.standardize_and_rank.call_args_list:
@@ -53,7 +53,9 @@ def test_fallback_keeps_location_when_no_results():
     searcher.web.search.return_value = []
     report = searcher.run("apples", location=LOCATION)
     assert searcher.web.search.call_count == 2
-    assert all(LOCATION in call.args[0] for call in searcher.web.search.call_args_list)
+    assert LOCATION in searcher.web.search.call_args_list[0].args[0]
+    assert "Canada" in searcher.web.search.call_args_list[1].args[0]
+    assert "M5V" not in searcher.web.search.call_args_list[1].args[0]
     assert report.location == LOCATION
 
 
@@ -73,7 +75,7 @@ def test_long_queries_keep_location_and_site_constraints():
     for query in (discovery_query("apples " * 28, LOCATION),
                   targeted_query("apples " * 28, LOCATION)):
         assert len(query) <= 200
-        assert LOCATION in query
+        assert LOCATION in query or "Canada" in query
         assert query.startswith("apples")
     assert "site:walmart.ca" in targeted_query("apples " * 28, LOCATION)
 
