@@ -13,10 +13,11 @@ class Settings:
     demo_user_handle: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+    mongo_uri: str = ""
 
     @classmethod
     def from_env(cls, *, messaging=True):
-        load_dotenv()
+        load_dotenv(override=True)
         required = ["BROWSERBASE_API_KEY"]
         if messaging:
             required += ["LINQ_API_KEY", "LINQ_WEBHOOK_SECRET", "DEMO_USER_HANDLE"]
@@ -31,5 +32,6 @@ class Settings:
             demo_user_handle=os.getenv("DEMO_USER_HANDLE", ""),
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_model=os.getenv("OPENAI_MODEL", "").strip() or cls.openai_model,
+            mongo_uri=os.getenv("MONGO_URI", ""),
         )
         return settings

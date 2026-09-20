@@ -179,3 +179,76 @@ def test_app_starts_without_database_or_credential_routes(config):
         assert client.get("/static/connect.js").status_code == 404
     finally:
         app.extensions["search"].close()
+
+
+def test_fetch_chat_endpoint_returns_ai_reply_and_updates(config, monkeypatch):
+    config = Settings(browserbase_api_key="test", linq_webhook_secret=SECRET,
+                      demo_user_handle="+15550000001", openai_api_key="openai-test")
+    monkeypatch.setattr("shopper.app.Settings.from_env", lambda **kwargs: config)
+    monkeypatch.setattr("shopper.app.run_fetch_chat", lambda **kwargs: {
+        "reply": "Added it to your calendar.",
+        "selected_date": "2026-09-28",
+        "calendar_updates": [{"action": "upsert", "date": "2026-09-28", "note": "Salmon bowl"}],
+        "preference_updates": [{"action": "add", "list": "favouriteFoods", "value": "Salmon bowls"}],
+    })
+    client = create_app(config, service=MagicMock()).test_client()
+
+    response = client.post("/api/fetch/chat", json={
+        "message": "Add salmon bowl to September 28",
+        "conversation": [{"role": "user", "text": "Hi"}],
+        "state": {"selectedDate": "2026-09-19", "calendar": {"entries": {}}},
+    }, headers={"Origin": "http://localhost:5500"})
+
+    assert response.status_code == 200
+    assert response.json == {
+        "reply": "Added it to your calendar.",
+        "selected_date": "2026-09-28",
+        "calendar_updates": [{"action": "upsert", "date": "2026-09-28", "note": "Salmon bowl"}],
+        "preference_updates": [{"action": "add", "list": "favouriteFoods", "value": "Salmon bowls"}],
+    }
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:5500"
+
+
+def test_fetch_chat_endpoint_requires_openai_key(monkeypatch):
+    config = Settings(browserbase_api_key="test", openai_api_key="")
+    monkeypatch.setattr("shopper.app.Settings.from_env", lambda **kwargs: config)
+    client = create_app(config, service=MagicMock()).test_client()
+
+    response = client.post("/api/fetch/chat", json={"message": "Hi", "conversation": [], "state": {}})
+
+    assert response.status_code == 503
+    assert "OPENAI_API_KEY" in response.json["error"]
+
+
+def test_fetch_orders_endpoint_returns_calendar_entries(monkeypatch):
+    config = Settings(browserbase_api_key="test", mongo_uri="mongodb://example",
+                      demo_user_handle="+15550000001")
+    monkeypatch.setattr("shopper.app.Settings.from_env", lambda **kwargs: config)
+    monkeypatch.setattr("shopper.app.load_order_calendar_entries", lambda **kwargs: {
+        "2026-09-28": "Order: Salmon bowl",
+        "2026-09-29": "Order: Lentil soup",
+    })
+    client = create_app(config, service=MagicMock()).test_client()
+
+    response = client.get("/api/fetch/orders", headers={"Origin": "http://localhost:5500"})
+
+    assert response.status_code == 200
+    assert response.json == {
+        "entries": {
+            "2026-09-28": "Order: Salmon bowl",
+            "2026-09-29": "Order: Lentil soup",
+        },
+        "count": 2,
+    }
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:5500"
+
+
+def test_fetch_orders_endpoint_requires_mongo_uri(monkeypatch):
+    config = Settings(browserbase_api_key="test", demo_user_handle="+15550000001")
+    monkeypatch.setattr("shopper.app.Settings.from_env", lambda **kwargs: config)
+    client = create_app(config, service=MagicMock()).test_client()
+
+    response = client.get("/api/fetch/orders")
+
+    assert response.status_code == 503
+    assert "MONGO_URI" in response.json["error"]

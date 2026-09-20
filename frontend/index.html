@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Fetch</title>
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=2026-09-20-ai-filter-remove-fix">
 </head>
 <body>
   <div class="page-shell">
@@ -93,8 +93,12 @@
             <span class="section-kicker">Planner</span>
             <h2>Food Calendar</h2>
           </div>
-          <p><span id="calendar-entry-count">0</span> saved days this month</p>
+          <div class="calendar-heading-side">
+            <button class="btn-remove calendar-import-btn" id="calendar-import-btn" type="button">Import Past Orders</button>
+            <p><span id="calendar-entry-count">0</span> saved days this month</p>
+          </div>
         </div>
+        <p class="calendar-import-status" id="calendar-import-status" data-state="idle">Loading past orders into the calendar.</p>
 
         <div class="calendar-shell">
           <div class="calendar-main">
@@ -112,11 +116,23 @@
           <aside class="calendar-detail" id="calendar-detail">
             <span class="detail-kicker">Selected date</span>
             <h3 id="calendar-detail-date"></h3>
-            <p id="calendar-detail-label">Add a note for meals, cravings, prep, or leftovers.</p>
-            <textarea id="calendar-detail-input" placeholder="Add food notes for this date"></textarea>
+            <p id="calendar-detail-label">Plan meals, prep, and reminders hour by hour across the day.</p>
+            <div class="calendar-entry-editor">
+              <div class="calendar-time-row">
+                <label class="calendar-time-label" id="calendar-time-label">Time slot</label>
+                <div class="calendar-time-roller-shell">
+                  <div class="calendar-time-roller" id="calendar-time-roller" role="listbox" aria-labelledby="calendar-time-label"></div>
+                </div>
+              </div>
+              <textarea id="calendar-detail-input" placeholder="Add a meal, snack, prep, or reminder for the selected time"></textarea>
+            </div>
+            <div class="calendar-saved-entries">
+              <span class="calendar-saved-kicker">Saved for this day</span>
+              <div class="calendar-saved-entry-list" id="calendar-saved-entry-list"></div>
+            </div>
             <div class="detail-actions">
               <button class="btn-add" id="calendar-save-btn">Save</button>
-              <button class="btn-remove" id="calendar-clear-btn">Clear</button>
+              <button class="btn-remove" id="calendar-clear-btn">Clear Slot</button>
             </div>
           </aside>
         </div>
@@ -124,6 +140,8 @@
     </main>
   </div>
 
-  <script src="app.js"></script>
+  <script id="fetch-ai-state" type="application/json"></script>
+
+  <script src="app.js?v=2026-09-20-ai-filter-remove-fix"></script>
 </body>
 </html>

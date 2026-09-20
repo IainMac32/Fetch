@@ -2,9 +2,14 @@ import atexit
 from flask import Flask, request
 
 from .config import Settings
+from .fetch_orders import FetchOrdersError, load_order_calendar_entries
 from .linq import LinqClient, incoming_message, verify_signature
 from .service import HELP, SearchService
 from .events import RecentEvents
+from .fetch_chat import FetchChatError, run_fetch_chat
+
+
+ALLOWED_FRONTEND_ORIGINS = {"http://localhost:5500", "http://127.0.0.1:5500"}
 
 def create_app(settings=None, *, service=None, events=None):
     settings = settings or Settings.from_env()
@@ -25,11 +30,67 @@ def create_app(settings=None, *, service=None, events=None):
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
         )
+        origin = request.headers.get("Origin")
+        if origin in ALLOWED_FRONTEND_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Vary"] = "Origin"
         return response
 
     @app.get("/")
     def home():
         return {"service": "MessageShopper", "message": HELP}
+
+    @app.route("/api/fetch/chat", methods=["POST", "OPTIONS"])
+    def fetch_chat():
+        if request.method == "OPTIONS":
+            return "", 204
+        runtime_settings = Settings.from_env(messaging=False)
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return {"error": "Expected a JSON object"}, 400
+        message = payload.get("message")
+        conversation = payload.get("conversation")
+        state = payload.get("state")
+        if not isinstance(message, str) or not message.strip():
+            return {"error": "Message is required."}, 400
+        if conversation is not None and not isinstance(conversation, list):
+            return {"error": "Conversation must be a list."}, 400
+        if state is not None and not isinstance(state, dict):
+            return {"error": "State must be a JSON object."}, 400
+        if not runtime_settings.openai_api_key:
+            return {"error": "OPENAI_API_KEY is not configured on the server."}, 503
+        try:
+            result = run_fetch_chat(
+                api_key=runtime_settings.openai_api_key,
+                model=runtime_settings.openai_model,
+                message=message.strip(),
+                conversation=conversation or [],
+                state=state or {},
+            )
+        except FetchChatError as exc:
+            return {"error": str(exc)}, 502
+        return result
+
+    @app.route("/api/fetch/orders", methods=["GET", "OPTIONS"])
+    def fetch_orders():
+        if request.method == "OPTIONS":
+            return "", 204
+        runtime_settings = Settings.from_env(messaging=False)
+        if not runtime_settings.mongo_uri:
+            return {"error": "MONGO_URI is not configured on the server."}, 503
+        if not runtime_settings.demo_user_handle:
+            return {"error": "DEMO_USER_HANDLE is not configured on the server."}, 503
+        try:
+            entries = load_order_calendar_entries(
+                mongo_uri=runtime_settings.mongo_uri,
+                phone_number=runtime_settings.demo_user_handle,
+            )
+        except FetchOrdersError as exc:
+            status_code = 503 if "configured" in str(exc) or "installed" in str(exc) else 502
+            return {"error": str(exc)}, status_code
+        return {"entries": entries, "count": len(entries)}
 
     @app.post("/linq-webhook")
     def webhook():
@@ -56,3 +117,7 @@ def create_app(settings=None, *, service=None, events=None):
         return "", 200
 
     return app
+
+
+if __name__ == "__main__":
+    create_app(Settings.from_env(messaging=False)).run(host="127.0.0.1", port=5000, threaded=True, use_reloader=False)
