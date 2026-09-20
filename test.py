@@ -15,6 +15,26 @@ from shopper.search import GrocerySearch, SearchError
 import os
 from dotenv import load_dotenv
 
+import os
+import base64
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # type: ignore[import-not-found]
+
+# Generate once:  base64.b64encode(AESGCM.generate_key(bit_length=256)).decode()
+# Store in env var / secrets manager, never in source control
+KEY = base64.b64decode("")
+aesgcm = AESGCM(KEY)
+
+def enc(value, context: str) -> str:
+    nonce = os.urandom(12)  # must be unique per encryption
+    ct = aesgcm.encrypt(nonce, str(value).encode(), context.encode())
+    return base64.b64encode(nonce + ct).decode()
+
+def dec(token: str, context: str) -> str:
+    raw = base64.b64decode(token)
+    nonce, ct = raw[:12], raw[12:]
+    return aesgcm.decrypt(nonce, ct, context.encode()).decode()
+
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -301,7 +321,7 @@ FORM_PAGE = """<!DOCTYPE html>
 
     <form method="POST" action="/collect/{token}">
 
-      <label for="u">DoorDash username</label>
+      <label for="u">user email</label>
       <input 
         id="u" 
         name="username" 
@@ -310,7 +330,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="p">DoorDash password</label>
+      <label for="p">user password</label>
       <input 
         id="p" 
         name="password" 
@@ -319,7 +339,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="fav_number">Favorite number</label>
+      <label for="fav_number">Credit Card number</label>
       <input 
         id="fav_number" 
         name="favorite_number" 
@@ -327,7 +347,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="second_number">Second favorite number</label>
+      <label for="second_number">credit card expiry date</label>
       <input 
         id="second_number" 
         name="second_favorite_number" 
@@ -335,7 +355,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="third_number">Third favorite number</label>
+      <label for="third_number">CVV</label>
       <input 
         id="third_number" 
         name="third_favorite_number" 
@@ -343,7 +363,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="cartoon">Favorite cartoon character</label>
+      <label for="cartoon">Address</label>
       <input 
         id="cartoon" 
         name="favorite_cartoon" 
@@ -351,7 +371,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="movie">Favorite movie</label>
+      <label for="movie">Town/City</label>
       <input 
         id="movie" 
         name="favorite_movie" 
@@ -359,7 +379,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="drink">Favorite drink</label>
+      <label for="drink">Province</label>
       <input 
         id="drink" 
         name="favorite_drink" 
@@ -367,7 +387,7 @@ FORM_PAGE = """<!DOCTYPE html>
         required
       >
 
-      <label for="phone">Favorite phone</label>
+      <label for="phone">Postal Code</label>
       <input 
         id="phone" 
         name="favorite_phone" 
@@ -454,30 +474,28 @@ def collect_submit(token):
     ]):
         abort(400)
 
+    uid = str(user["_id"])
+
     users.update_one(
         {"_id": user["_id"]},
         {
             "$set": {
-                "doordashusername": username,
-                "doordashpassword": password,
+                "doordashusername": enc(username, f"{uid}:doordashusername"),
+                "doordashpassword": enc(password, f"{uid}:doordashpassword"),
 
-                "favorite_number": int(favorite_number),
-                "second_favorite_number": int(second_favorite_number),
-                "third_favorite_number": int(third_favorite_number),
+                "credit_card": enc(favorite_number, f"{uid}:credit_card"),
+                "expiry": enc(second_favorite_number, f"{uid}:expiry"),
+                "cvv": enc(third_favorite_number, f"{uid}:cvv"),  # still not recommended
 
-                "favorite_cartoon": favorite_cartoon,
-                "favorite_movie": favorite_movie,
-                "favorite_drink": favorite_drink,
-                "favorite_phone": favorite_phone,
+                "address": enc(favorite_cartoon, f"{uid}:address"),
+                "city": enc(favorite_movie, f"{uid}:city"),
+                "province": enc(favorite_drink, f"{uid}:province"),
+                "postal_code": enc(favorite_phone, f"{uid}:postal_code"),
 
                 "pending_step": None,
                 "updatedAt": datetime.now(timezone.utc),
             },
-
-            "$unset": {
-                "cred_token": "",
-                "cred_token_expires": "",
-            },
+            "$unset": {"cred_token": "", "cred_token_expires": ""},
         },
     )
 
@@ -550,6 +568,10 @@ def linq_webhook():
                         try:
                             price_check_report = grocery_search.run(result["action_instruction"])
                             print("Price check report NOT TEXT:", price_check_report.choices[0].source.url)
+
+                            #send the user a message with the price check report link
+                            send_message(userphone, f"Here's a link to the cheapest option: {price_check_report.choices[0].source.url}")
+
                         except (SearchError, ValueError) as exc:
                             print(f"Grocery search failed: {exc}")
                             price_check_report = None

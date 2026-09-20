@@ -27,18 +27,15 @@ SEARCH_RESULT_LIMIT = 25
 FETCH_LIMIT = 10
 SUPPORTED_PLATFORMS = {
 
-    "DoorDash": ("doordash.com",),
+    "SkipTheDishes": ("skipthedishes.com",),
+    "Uber Eats": ("ubereats.com",),
+    "Walmart": ("walmart.ca", "walmart.com"),
+    "Instacart": ("instacart.ca", "instacart.com"),
 }
 
 
-    
-    #    "SkipTheDishes": ("skipthedishes.com",),
-    #"Uber Eats": ("ubereats.com",),
-    #"Walmart": ("walmart.ca", "walmart.com"),
-    #"Instacart": ("instacart.ca", "instacart.com"),
-    #    
-   #
-   #    
+#    "DoorDash": ("doordash.com",),
+
 
 
 
