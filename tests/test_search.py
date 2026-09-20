@@ -16,15 +16,16 @@ from shopper.search import (DEMO_SEARCH_QUERY, PAGE_CHAR_LIMIT, BrowserbaseWeb, 
 from shopper.service import SearchService
 from test_flow import SECRET, headers, payload
 
+TEST_QUERY = "unsweetened oat milk 1L Canada"
 CONTENT = "Example Unsweetened Oat Milk 1L. Listed price $4.29 CAD. Available online in Canada."
 SETTINGS = Settings(browserbase_api_key="bb-test", openai_api_key="openai-test",
                     demo_user_handle="+15550000001", linq_webhook_secret=SECRET)
 
 
 def offer_data(**overrides):
-    return {"source_id": "1", "product_type": "oat_milk",
-            "product_quote": "Example Unsweetened Oat Milk 1L", "variant": "unsweetened",
-            "variant_quote": "Unsweetened", "size_quote": "Oat Milk 1L",
+    return {"source_id": "1", "name_quote": "Example Unsweetened Oat Milk 1L",
+            "attribute_quotes": ["Unsweetened"], "merchant_quote": None,
+            "size_quote": "Oat Milk 1L",
             "price_quote": "$4.29 CAD", "availability_quote": "Available online in Canada",
             **overrides}
 
@@ -58,13 +59,13 @@ def api(monkeypatch):
 
 
 def test_search_then_fetch_then_rank_uses_real_provider_contracts(api):
-    report = GrocerySearch(SETTINGS).run()
+    report = GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert report.found == 25 and report.fetched == 10
     assert len(report.choices) == 1
     assert "https://www.walmart.ca/product/0" in report.as_text()
     assert "Listed price: $4.29 CAD ($4.29/L)" in report.as_text()
     assert api[0][0] == "https://api.browserbase.com/v1/search"
-    assert api[0][1]["json"] == {"query": DEMO_SEARCH_QUERY, "numResults": 25}
+    assert api[0][1]["json"] == {"query": TEST_QUERY, "numResults": 25}
     assert api[0][1]["headers"] == {"X-BB-API-Key": "bb-test"}
     assert len(api) == 12
     for url, args in api[1:-1]:
@@ -117,7 +118,7 @@ def test_partial_fetch_failure_only_ranks_readable_pages(api):
         raise SearchError("Page unavailable")
 
     search.web.fetch = fetch
-    report = search.run()
+    report = search.run(TEST_QUERY)
     assert report.found == 25 and report.fetched == 1
     assert "Read 1 of 25" in report.as_text()
     assert len(json.loads(api[-1][1]["json"]["input"][1]["content"])["sources"]) == 1
@@ -137,14 +138,11 @@ def test_empty_search_and_failed_fetches_do_not_call_ai(api):
 
 @pytest.mark.parametrize("offers,reason,field", [
     ([offer_data(source_id="invented")], "unknown_or_duplicate_source", "source_id"),
-    ([offer_data(price_quote="$0.01 CAD")], "quote_not_in_source", "price_quote"),
-    ([offer_data(product_quote="Organic certified")], "quote_not_in_source", "product_quote"),
-    ([offer_data(variant_quote="Sweetened")], "variant_not_evidenced", "variant_quote"),
+    ([offer_data(name_quote="Organic certified")], "quote_not_in_source", "name_quote"),
+    ([offer_data(attribute_quotes=["Organic certified"])], "quote_not_in_source", "attribute_quotes"),
     ([offer_data(extra="unexpected")], "invalid_offer_fields", "-"),
-    ([offer_data(product_type="almond_milk")], "category_not_evidenced", "product_quote"),
-    ([offer_data(variant="unknown")], "unknown_variant_has_quote", "variant_quote"),
-    ([offer_data(availability_quote="Example Unsweetened Oat Milk 1L")],
-     "availability_not_recognized", "availability_quote"),
+    ([offer_data(name_quote=None)], "no_product_named", "name_quote"),
+    ([offer_data(attribute_quotes="Unsweetened")], "invalid_attributes", "attribute_quotes"),
 ])
 def test_rejects_ungrounded_ai_output_with_safe_diagnostics(monkeypatch, caplog, offers, reason, field):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response(offers))
@@ -161,17 +159,17 @@ def test_rejects_ungrounded_ai_output_with_safe_diagnostics(monkeypatch, caplog,
 def test_duplicate_source_is_identified_without_logging_source_value(monkeypatch, caplog):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([offer_data(), offer_data()]))
     with pytest.raises(SearchError):
-        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+        ProductStandardizer("key", "model").standardize_and_rank(TEST_QUERY, [
             Source("1", "Milk", "https://shop.example/1", CONTENT),
             Source("2", "Milk", "https://shop.example/2", CONTENT)])
     assert "reason=unknown_or_duplicate_source offer=2 field=source_id" in caplog.text
 
 
-@pytest.mark.parametrize("bad_field", ["product_quote", "price_quote", "availability_quote"])
+@pytest.mark.parametrize("bad_field", ["name_quote", "size_quote"])
 def test_unverified_offer_does_not_discard_verified_almond_milk(monkeypatch, caplog, bad_field):
     content = CONTENT.replace("Oat", "Almond")
-    good = offer_data(source_id="2", product_type="almond_milk",
-                      product_quote="Example Unsweetened Almond Milk 1L", size_quote="Almond Milk 1L")
+    good = offer_data(source_id="2",
+                      name_quote="Example Unsweetened Almond Milk 1L", size_quote="Almond Milk 1L")
     bad = {**good, "source_id": "1", bad_field: "invented evidence"}
     post = MagicMock(return_value=ai_response([bad, good]))
     monkeypatch.setattr("shopper.search.post_json", post)
@@ -182,7 +180,7 @@ def test_unverified_offer_does_not_discard_verified_almond_milk(monkeypatch, cap
             Source("2", "Almond Milk", "https://shop.example/2", content)])
 
     assert [offer.source.id for offer in choices] == ["2"]
-    assert choices[0].product_type == "almond_milk"
+    assert choices[0].name_quote == "Example Unsweetened Almond Milk 1L"
     assert choices[0].price_quote == "$4.29 CAD"
     assert "Skipping unverified offer" in caplog.text
     assert f"reason=quote_not_in_source offer=1 field={bad_field}" in caplog.text
@@ -192,24 +190,89 @@ def test_unverified_offer_does_not_discard_verified_almond_milk(monkeypatch, cap
 
 def test_all_unverified_offers_still_fail_and_report_each_reason(monkeypatch, caplog):
     post = MagicMock(return_value=ai_response([
-        offer_data(product_quote="invented product"),
-        offer_data(source_id="2", price_quote="$0.01 CAD")]))
+        offer_data(name_quote="invented product"),
+        offer_data(source_id="2", name_quote=None)]))
     monkeypatch.setattr("shopper.search.post_json", post)
     with pytest.raises(SearchError, match="couldn't verify"):
-        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+        ProductStandardizer("key", "model").standardize_and_rank(TEST_QUERY, [
             Source("1", "Milk", "https://shop.example/1", CONTENT),
             Source("2", "Milk", "https://shop.example/2", CONTENT)])
-    assert "offer=1 field=product_quote" in caplog.text
-    assert "offer=2 field=price_quote" in caplog.text
+    assert "offer=1 field=name_quote" in caplog.text
+    assert "offer=2 field=name_quote" in caplog.text
     assert "reason=no_verified_offers" in caplog.text
     post.assert_called_once()
 
 
+@pytest.mark.parametrize("field,value", [
+    ("price_quote", "$0.01 CAD"),
+    ("price_quote", 0.01),
+    ("availability_quote", "invented stock evidence"),
+    ("availability_quote", "Example Unsweetened Oat Milk 1L"),
+])
+def test_bad_optional_evidence_keeps_product_without_claiming_price_or_stock(monkeypatch, caplog, field, value):
+    post = MagicMock(return_value=ai_response([offer_data(**{field: value})]))
+    monkeypatch.setattr("shopper.search.post_json", post)
+    source = Source("1", "Milk", "https://shop.example/milk", CONTENT)
+    choices = ProductStandardizer("secret-api-key", "model").standardize_and_rank(TEST_QUERY, [source])
+    assert len(choices) == 1
+    offer = choices[0]
+    assert offer.name_quote == "Example Unsweetened Oat Milk 1L"
+    assert getattr(offer, field) is None
+    text = SearchReport(TEST_QUERY, 1, 1, choices).as_text()
+    if field == "price_quote":
+        assert offer.price_amount is offer.currency is offer.unit_price is None
+        assert "Listed price: not confirmed" in text
+        assert "Price evidence:" not in text
+        assert "Price not confirmed" in offer.reasons
+    else:
+        assert offer.availability == "unknown"
+        assert "Availability: not confirmed" in text
+        assert "Availability not confirmed" in offer.reasons
+    assert f"offer=1 field={field}" in caplog.text
+    assert "secret-api-key" not in caplog.text
+    assert CONTENT not in caplog.text
+    assert str(value) not in caplog.text
+    post.assert_called_once()
+
+
+def test_apple_batch_preserves_optional_field_failures_but_rejects_invented_names(monkeypatch):
+    # Reproduce the four rejection types from the live log with synthetic evidence.
+    content = "Apples 1 kg. CAD$3.00. Check your local store."
+    base = {"source_id": "1", "name_quote": "Apples 1 kg", "attribute_quotes": [],
+            "merchant_quote": None, "size_quote": "1 kg", "price_quote": "CAD$3.00", "availability_quote": None}
+    offers = [
+        {**base, "price_quote": "CAD$0.01"},
+        {**base, "source_id": "2", "availability_quote": "Check your local store"},
+        {**base, "source_id": "3", "availability_quote": "Check your local store"},
+        {**base, "source_id": "4", "name_quote": "Organic Apples 1 kg"},
+    ]
+    post = MagicMock(return_value=ai_response(offers))
+    monkeypatch.setattr("shopper.search.post_json", post)
+    choices = ProductStandardizer("key", "model").standardize_and_rank("6 apples", [
+        Source(str(index), "Apples", f"https://www.walmart.ca/apples/{index}", content)
+        for index in range(1, 5)
+    ])
+    assert {offer.source.id for offer in choices} == {"1", "2", "3"}
+    assert all(offer.availability == "unknown" for offer in choices)
+    assert next(offer for offer in choices if offer.source.id == "1").price_amount is None
+    post.assert_called_once()
+
+
+@pytest.mark.parametrize("wording", ["Out of stock", "Not in stock", "Not currently available",
+                                    "Not available online. Add to cart"])
+def test_verified_negative_stock_still_excludes_product(monkeypatch, wording):
+    post = MagicMock(return_value=ai_response([offer_data(availability_quote=wording)]))
+    monkeypatch.setattr("shopper.search.post_json", post)
+    choices = ProductStandardizer("key", "model").standardize_and_rank(TEST_QUERY, [
+        Source("1", "Milk", "https://shop.example/milk", CONTENT + " " + wording)])
+    assert choices == []
+
+
 def test_rejected_offer_cannot_reuse_its_source_id(monkeypatch, caplog):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([
-        offer_data(product_quote="invented product"), offer_data()]))
+        offer_data(name_quote="invented product"), offer_data()]))
     with pytest.raises(SearchError):
-        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+        ProductStandardizer("key", "model").standardize_and_rank(TEST_QUERY, [
             Source("1", "Milk", "https://shop.example/1", CONTENT),
             Source("2", "Milk", "https://shop.example/2", CONTENT)])
     assert "reason=unknown_or_duplicate_source offer=2" in caplog.text
@@ -217,12 +280,12 @@ def test_rejected_offer_cannot_reuse_its_source_id(monkeypatch, caplog):
 
 def test_quote_cannot_join_title_and_content_into_new_evidence(monkeypatch, caplog):
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([
-        offer_data(product_quote="Oat Milk", variant="unknown", variant_quote=None,
+        offer_data(name_quote="Oat Milk", attribute_quotes=[],
                    size_quote=None, price_quote=None, availability_quote=None)]))
     with pytest.raises(SearchError):
-        ProductStandardizer("key", "model").standardize_and_rank(DEMO_SEARCH_QUERY, [
+        ProductStandardizer("key", "model").standardize_and_rank(TEST_QUERY, [
             Source("1", "Oat", "https://shop.example/1", "Milk")])
-    assert "reason=quote_not_in_source offer=1 field=product_quote" in caplog.text
+    assert "reason=quote_not_in_source offer=1 field=name_quote" in caplog.text
 
 
 @pytest.mark.parametrize("response,reason", [
@@ -251,10 +314,10 @@ def test_unknown_price_is_explicit_and_empty_ranking_is_valid(monkeypatch):
     source = Source("1", "Milk", "https://shop.example/milk", CONTENT)
     ranker = ProductStandardizer("key", "model")
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([offer_data(price_quote=None)]))
-    choices = ranker.standardize_and_rank(DEMO_SEARCH_QUERY, [source])
-    assert "Listed price: not confirmed" in SearchReport(DEMO_SEARCH_QUERY, 1, 1, choices).as_text()
+    choices = ranker.standardize_and_rank(TEST_QUERY, [source])
+    assert "Listed price: not confirmed" in SearchReport(TEST_QUERY, 1, 1, choices).as_text()
     monkeypatch.setattr("shopper.search.post_json", lambda *a, **k: ai_response([]))
-    assert ranker.standardize_and_rank(DEMO_SEARCH_QUERY, [source]) == []
+    assert ranker.standardize_and_rank(TEST_QUERY, [source]) == []
 
 
 @pytest.mark.parametrize("stage", ["search", "fetch", "rank"])
@@ -299,7 +362,7 @@ def test_provider_failure_is_sanitized(monkeypatch):
     monkeypatch.setattr("shopper.search.requests.post", MagicMock(side_effect=requests.HTTPError(
         "secret-key provider response", response=response)))
     with pytest.raises(SearchError, match="API access") as exc:
-        GrocerySearch(SETTINGS).run()
+        GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert "secret-key" not in str(exc.value)
 
 
@@ -314,7 +377,7 @@ def test_invalid_query_never_calls_providers(api, query):
 def test_network_failures_become_retryable_user_messages(monkeypatch, failure):
     monkeypatch.setattr("shopper.search.requests.post", MagicMock(side_effect=failure))
     with pytest.raises(SearchError, match="try again") as exc:
-        GrocerySearch(SETTINGS).run()
+        GrocerySearch(SETTINGS).run(TEST_QUERY)
     assert "secret" not in str(exc.value)
 
 
@@ -325,7 +388,8 @@ def test_cli_runs_pipeline_and_returns_failure_exit_code(api, monkeypatch, capsy
     monkeypatch.setattr("sys.argv", ["searchtest.py", "unsweetened oat milk Canada"])
     assert searchtest.main() == 0
     output = capsys.readouterr()
-    assert "Best matches" in output.out
+    assert output.out.startswith("Recommended site: Walmart")
+    assert "Product evidence:" not in output.out
     assert "Searching the web" in output.err
     assert api[0][1]["json"]["query"] == "unsweetened oat milk Canada"
     api.clear()
@@ -343,11 +407,11 @@ def dispatch(service, text, *, chat="chat-a", handle=SETTINGS.demo_user_handle):
 
 def test_signed_search_webhook_runs_without_login_and_deduplicates(api):
     messenger, sent = MagicMock(), threading.Event()
-    messenger.send.side_effect = lambda chat, text: sent.set() if "Best matches" in text else None
+    messenger.send.side_effect = lambda chat, text: sent.set() if "Recommended site:" in text else None
     service = SearchService(SETTINGS, messenger)
     try:
         client = create_app(SETTINGS, service=service).test_client()
-        body = json.dumps(payload(text=" SEARCH ")).encode()
+        body = json.dumps(payload(text=" SEARCH " + TEST_QUERY)).encode()
         assert client.post("/linq-webhook", data=body, headers=headers(body)).status_code == 200
         assert client.post("/linq-webhook", data=body, headers=headers(body)).status_code == 200
         assert sent.wait(3)
