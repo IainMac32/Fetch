@@ -24,7 +24,7 @@ SETTINGS = Settings(browserbase_api_key="bb-test", openai_api_key="openai-test",
 
 def offer_data(**overrides):
     return {"source_id": "1", "name_quote": "Example Unsweetened Oat Milk 1L",
-            "attribute_quotes": ["Unsweetened"], "merchant_quote": None,
+            "attribute_quotes": ["Unsweetened"], "merchant_quote": None, "match_type": "direct_product",
             "size_quote": "Oat Milk 1L",
             "price_quote": "$4.29 CAD", "availability_quote": "Available online in Canada",
             **overrides}
@@ -239,6 +239,7 @@ def test_apple_batch_preserves_optional_field_failures_but_rejects_invented_name
     # Reproduce the four rejection types from the live log with synthetic evidence.
     content = "Apples 1 kg. CAD$3.00. Check your local store."
     base = {"source_id": "1", "name_quote": "Apples 1 kg", "attribute_quotes": [],
+            "match_type": "direct_product",
             "merchant_quote": None, "size_quote": "1 kg", "price_quote": "CAD$3.00", "availability_quote": None}
     offers = [
         {**base, "price_quote": "CAD$0.01"},
