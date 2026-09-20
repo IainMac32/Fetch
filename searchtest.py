@@ -20,8 +20,11 @@ def main():
         search = GrocerySearch(Settings.from_env(messaging=False))
         report = search.run(args.query, progress=lambda message: print(message, file=sys.stderr))
     except (SearchError, ValueError) as exc:
+        print("TWO!")
         print(str(exc), file=sys.stderr)
+        print("end two")
         return 1
+    print("ONE!")
     print(report.as_text())
     return 0
 
